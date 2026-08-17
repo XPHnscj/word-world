@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { parseIelts4000, pickDiverseVocabulary } from "./ieltsVocab";
+import { parseIelts4000, pickDiverseVocabulary, pickPriorityThenDiverseVocabulary } from "./ieltsVocab";
 
 describe("parseIelts4000", () => {
   it("parses a single word: definition line", () => {
@@ -73,5 +73,37 @@ describe("pickDiverseVocabulary", () => {
 
     expect(picked).toHaveLength(15);
     expect(new Set(picked.map((word) => word[0])).size).toBe(15);
+  });
+});
+
+describe("pickPriorityThenDiverseVocabulary", () => {
+  it("uses priority words first and keeps the daily cap", () => {
+    const entries = ["adapt", "balance", "climate", "decline"].map((lemma) => ({ lemma, definition: lemma }));
+    const picked = pickPriorityThenDiverseVocabulary(
+      ["unknown", "adapt", "adapt", "balance"],
+      entries,
+      new Set(),
+      3,
+      () => 0.5,
+    );
+
+    expect(picked).toEqual(["unknown", "adapt", "balance"]);
+    expect(picked).toHaveLength(3);
+    expect(new Set(picked).size).toBe(3);
+  });
+
+  it("does not reselect learned priority words and fills with diverse built-ins", () => {
+    const entries = ["adapt", "balance", "climate"].map((lemma) => ({ lemma, definition: lemma }));
+    const picked = pickPriorityThenDiverseVocabulary(
+      ["adapt", "unknown"],
+      entries,
+      new Set(["adapt"]),
+      2,
+      () => 0.5,
+    );
+
+    expect(picked[0]).toBe("unknown");
+    expect(picked).toHaveLength(2);
+    expect(picked).not.toContain("adapt");
   });
 });

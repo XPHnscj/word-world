@@ -6,17 +6,20 @@ import { useLiveQuery } from "dexie-react-hooks";
 import {
   DEMO_LEMMAS,
   appendEvidenceServer,
+  addPriorityWord,
   ensurePersistentStorage,
   flushPendingEvidence,
   isoNow,
   learningDB,
   makePack,
+  PRIORITY_WORD_BOOK_ID,
   readLocalSnapshot,
   readServerSnapshot,
   replaceLocalSnapshot,
   replacePackForDay,
   resetEntireSystem,
   resetStudyProgress,
+  removePriorityWord,
   scheduleServerSnapshotSync,
   toggleWordKnown,
   writeServerSnapshot,
@@ -26,7 +29,7 @@ import { adaptiveSchedule, applyDimensionEvidence, buildAdaptiveQueue, capabilit
 import { makeReviewDemoBundle } from "@/lib/reviewDemo";
 import {
   loadBuiltinVocab,
-  pickDiverseVocabulary,
+  pickPriorityThenDiverseVocabulary,
   type IeltsEntry,
 } from "@/lib/ieltsVocab";
 import { countEnglishWords, findDuplicateTarget, findMissingTargets, findMissingTranslationAnnotations, hasCompleteTranslationAnnotations, normalizeTranslationChunk, parseContextPack } from "@/lib/contextPack";
@@ -274,6 +277,7 @@ export default function Page() {
   const livePacks = useLiveQuery(() => learningDB.packs.toArray(), []);
   const liveAttempts = useLiveQuery(() => learningDB.attempts.toArray(), []);
   const liveKnown = useLiveQuery(() => learningDB.known.toArray(), []);
+  const liveWordbooks = useLiveQuery(() => learningDB.wordbooks.toArray(), []);
   const cards = useMemo(() => liveCards ?? [], [liveCards]);
   const packs = useMemo(() => livePacks ?? [], [livePacks]);
   const attempts = useMemo(() => liveAttempts ?? [], [liveAttempts]);
@@ -282,6 +286,10 @@ export default function Page() {
     () => new Set((liveKnown ?? []).map((entry) => entry.lemma)),
     [liveKnown],
   );
+  const priorityWords = useMemo(() => {
+    const book = (liveWordbooks ?? []).find((item) => item.id === PRIORITY_WORD_BOOK_ID);
+    return book?.words.split(/\r?\n/).map((word) => word.trim().toLowerCase()).filter(Boolean) ?? [];
+  }, [liveWordbooks]);
   /** 内置词库查找表：lemma -> 英文释义。 */
   const vocabMap = useMemo(
     () => new Map(vocab.map((entry) => [entry.lemma, entry.definition])),
@@ -295,11 +303,16 @@ export default function Page() {
       for (const use of pack.targetWords) studied.add(use.lemma.toLowerCase());
     return studied;
   }, [cards, packs]);
-  /** 内置词库中下一组未学过的词：随机抽取并分散首字母。 */
+  /** 主词库中下一组词：明日优先词先取，剩余名额再从未学词随机抽取。 */
   const nextLibraryWords = useMemo(() => {
     const excluded = new Set([...studiedLemmas, ...knownSet]);
-    return pickDiverseVocabulary(vocab, excluded, aiSettings.dailyNewWords);
-  }, [vocab, studiedLemmas, knownSet, aiSettings.dailyNewWords]);
+    return pickPriorityThenDiverseVocabulary(
+      priorityWords,
+      vocab,
+      excluded,
+      aiSettings.dailyNewWords,
+    );
+  }, [vocab, studiedLemmas, knownSet, priorityWords, aiSettings.dailyNewWords]);
   const totalDays = Math.max(1, aiSettings.targetDays);
   const dayGroups = useMemo(() => buildDayGroups(totalDays), [totalDays]);
   const reviewColumns = useMemo(
@@ -900,12 +913,26 @@ export default function Page() {
     const nowKnown = await toggleWordKnown(lemma);
     // 主观“会了”证据：只记录，不作为客观掌握依据。
     if (nowKnown) {
+      await removePriorityWord(lemma);
       const event = makeEvidence(lemma, "formRecognition", "skip-known", true, 100, {
         hintLevel: 0,
         confidence: 5,
       });
       void appendEvidenceServer([event]);
     }
+  };
+
+  /** 把当前遇到的词放进主词库扩展，下一篇文章优先使用；每日数量仍由设置统一控制。 */
+  const addUnknownWord = async (lemma: string) => {
+    const added = await addPriorityWord(lemma);
+    const alreadyInBuiltin = vocabMap.has(lemma.toLowerCase());
+    setToast({
+      message: added
+        ? alreadyInBuiltin
+          ? `“${lemma}”已加入明日优先词，下一篇文章会优先融入。`
+          : `“${lemma}”已加入主词库扩展，下一篇文章会优先融入。`
+        : `“${lemma}”已经在明日优先词中。`,
+    });
   };
 
   const startReading = (day: number, initialMode: "show" | "spell" = "show") => {
@@ -1063,6 +1090,8 @@ export default function Page() {
     // 因此归为“使用提示后”的结果，hintLevel=2，不记为无提示独立掌握）。
     const evidence = checkable.map((word) => {
       const ok = results[word.lemma] === "correct";
+      if (ok) void removePriorityWord(word.lemma);
+      else void addPriorityWord(word.lemma);
       return makeEvidence(word.lemma, "spelling", "spell", ok, ok ? 100 : 0, {
         hintLevel: 2,
         confidence: ok ? 4 : 1,
@@ -1176,6 +1205,8 @@ export default function Page() {
   const commitReviewRating = async () => {
     if (!reviewCard || !pendingReviewRating) return;
     const rating = pendingReviewRating;
+    if (rating === "forgot") void addPriorityWord(reviewCard.lemma);
+    if (rating === "known") void removePriorityWord(reviewCard.lemma);
     const reviewedAt = isoNow();
     const evaluationPassed = Boolean(reviewEvaluation?.passed);
     const level = getMasteryLevel(reviewCard);
@@ -1427,6 +1458,7 @@ export default function Page() {
             generating={generating}
             knownSet={knownSet}
             onToggleSkip={toggleSkipWord}
+            onAddPriority={addUnknownWord}
             adjustment={adjustmentText}
             setAdjustment={setAdjustmentText}
             onRegenerate={regeneratePack}
@@ -1529,10 +1561,12 @@ function Import({
   vocabLoading: boolean;
   generating: boolean;
 }) {
-  const customWordbooks = useLiveQuery(
+  const allWordbooks = useLiveQuery(
     () => learningDB.wordbooks.orderBy("createdAt").toArray(),
     [],
   ) ?? [];
+  // 系统维护的明日优先队列属于主词库扩展，不作为普通自定义词书展示。
+  const customWordbooks = allWordbooks.filter((book) => book.id !== PRIORITY_WORD_BOOK_ID);
   const [activeWordbook, setActiveWordbook] = useState("builtin-ielts");
   const [creatorOpen, setCreatorOpen] = useState(false);
   const [newBookName, setNewBookName] = useState("");
@@ -2250,6 +2284,7 @@ function Reading({
   generating,
   knownSet,
   onToggleSkip,
+  onAddPriority,
   adjustment,
   setAdjustment,
   onRegenerate,
@@ -2278,6 +2313,7 @@ function Reading({
   generating: boolean;
   knownSet: Set<string>;
   onToggleSkip: (lemma: string) => void;
+  onAddPriority: (lemma: string) => void;
   adjustment: string;
   setAdjustment: (value: string) => void;
   onRegenerate: () => void;
@@ -2369,6 +2405,7 @@ function Reading({
               definitionOf,
               knownSet,
               onToggleSkip,
+              onAddPriority,
             )}
           </p>
           {pack.keySentence && (
@@ -2467,6 +2504,7 @@ function renderEnglish(
   definitionOf: (lemma: string) => string | undefined,
   knownSet: Set<string>,
   onToggleSkip: (lemma: string) => void,
+  onAddPriority: (lemma: string) => void,
 ) {
   const keySentence = pack.keySentence
     ? normalizeForMatch(pack.keySentence.sentence)
@@ -2540,6 +2578,14 @@ function renderEnglish(
                 >
                   （{target.meaningZh} · {formatPartOfSpeech(target.partOfSpeech)}）
                 </button>
+                <button
+                  type="button"
+                  className="priority-word-action"
+                  title="加入主词库扩展，下一篇文章优先出现"
+                  onClick={() => onAddPriority(target.lemma)}
+                >
+                  加入明日优先
+                </button>
               </span>
             );
           }
@@ -2573,6 +2619,16 @@ function renderEnglish(
                   {target.rhetoricalFunction && <span>修辞功能：{target.rhetoricalFunction}</span>}
                   {target.register && <span>语域：{target.register}</span>}
                   {target.confusables?.length ? <span>易混词：{target.confusables.join("、")}</span> : null}
+                  <button
+                    type="button"
+                    className="priority-word-action"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onAddPriority(target.lemma);
+                    }}
+                  >
+                    加入主词库 · 明日优先
+                  </button>
                 </span>
               )}
             </span>
