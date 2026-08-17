@@ -295,6 +295,10 @@ export default function Page() {
     () => new Map(vocab.map((entry) => [entry.lemma, entry.definition])),
     [vocab],
   );
+  const totalLibraryCount = useMemo(
+    () => vocab.length + new Set(priorityWords.filter((word) => !vocabMap.has(word))).size,
+    [vocab.length, priorityWords, vocabMap],
+  );
   /** 已学（出现在词卡或已生成短文里）的词元，用于从词库顺序取下一组。 */
   const studiedLemmas = useMemo(() => {
     const studied = new Set<string>();
@@ -1426,7 +1430,7 @@ export default function Page() {
             uploadStatus={uploadStatus}
             onGenerateLibrary={generateLibraryPack}
             onPlanWordbook={updatePlanVocabulary}
-            libraryCount={vocab.length}
+            libraryCount={totalLibraryCount}
             vocabLoading={vocabLoading}
             generating={generating}
           />
@@ -1508,7 +1512,7 @@ export default function Page() {
             setSettings={setAiSettings}
             onExport={exportLearningData}
             onReset={resetApplication}
-            libraryCount={vocab.length}
+            libraryCount={totalLibraryCount}
             vocabLoading={vocabLoading}
           />
         )}
@@ -2087,7 +2091,7 @@ function Settings({
                   }
                 />
                 <small>
-                  内置 IELTS 词库共{" "}
+                  主词库（含本地扩展）共{" "}
                   {vocabLoading
                     ? "…"
                     : libraryCount
