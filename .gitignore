@@ -1,0 +1,29 @@
+# dependencies
+/node_modules
+
+# Next.js build output
+/.next
+/.next-dev
+/out
+/output
+
+# project-bound SQLite data
+/data/*.sqlite
+/data/*.sqlite-shm
+/data/*.sqlite-wal
+
+# local files
+.env*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+
+# test and browser artifacts
+/coverage
+/.playwright-cli
+/outputs
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
