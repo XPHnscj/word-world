@@ -9,7 +9,7 @@ describe("parseContextPack", () => {
       passage: "Cities adapt to change.",
       translation: "城市适应变化。",
       words: [
-        { lemma: "Adapt", phonetic: "/əˈdæpt/", meaningZh: "适应", morphology: "ad-（向）+ apt（适合）", partOfSpeech: "verb", collocation: "adapt to change" },
+        { lemma: "Adapt", phonetic: "/əˈdæpt/", meaningZh: "适应", morphology: "ad-（向）+ apt（适合）", partOfSpeech: "verb", collocation: "adapt to change", phraseFrame: "adapt to + noun", rhetoricalFunction: "动作推进", register: "formal", confusables: ["adopt"] },
         { lemma: "resilient", meaningZh: "有韧性的", partOfSpeech: "adj", collocation: "resilient system" },
       ],
     });
@@ -18,6 +18,7 @@ describe("parseContextPack", () => {
     expect(parsed.translation).toBe("城市适应变化。");
     expect(parsed.meanings).toHaveLength(2);
     expect(parsed.meanings?.[0]).toMatchObject({ lemma: "adapt", phonetic: "/əˈdæpt/", meaningZh: "适应", morphology: "ad-（向）+ apt（适合）", partOfSpeech: "verb" });
+    expect(parsed.meanings?.[0]).toMatchObject({ phraseFrame: "adapt to + noun", rhetoricalFunction: "动作推进", register: "formal", confusables: ["adopt"] });
   });
 
   it("extracts the key sentence with its pattern and explanation", () => {

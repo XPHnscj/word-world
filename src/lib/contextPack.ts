@@ -6,6 +6,14 @@ export interface WordMeta {
   morphology?: string;
   partOfSpeech: string;
   collocation: string;
+  /** 可直接迁移的词块框架，例如 allocate resources to ...。 */
+  phraseFrame?: string;
+  /** 该词在正文中的修辞功能（让步、因果、举例等），不是泛化主题。 */
+  rhetoricalFunction?: string;
+  /** 正式、学术、口语等语域提示。 */
+  register?: string;
+  /** 适合在复习时对比的易混词。 */
+  confusables?: string[];
 }
 
 export interface KeySentenceMeta {
@@ -162,6 +170,15 @@ export function parseContextPack(
                 typeof entry.partOfSpeech === "string" ? entry.partOfSpeech.trim() : "",
               collocation:
                 typeof entry.collocation === "string" ? entry.collocation.trim() : "",
+              phraseFrame:
+                typeof entry.phraseFrame === "string" ? entry.phraseFrame.trim() : undefined,
+              rhetoricalFunction:
+                typeof entry.rhetoricalFunction === "string" ? entry.rhetoricalFunction.trim() : undefined,
+              register:
+                typeof entry.register === "string" ? entry.register.trim() : undefined,
+              confusables: Array.isArray(entry.confusables)
+                ? entry.confusables.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean).slice(0, 4)
+                : undefined,
             };
           })
           .filter((word) => expected.has(word.lemma) && word.meaningZh)

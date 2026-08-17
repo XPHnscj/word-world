@@ -566,7 +566,7 @@ export default function Page() {
     translation?: string;
     meanings: Record<
       string,
-      { meaningZh: string; translationZh?: string; phonetic?: string; morphology?: string; partOfSpeech: string; collocation: string }
+      { meaningZh: string; translationZh?: string; phonetic?: string; morphology?: string; partOfSpeech: string; collocation: string; phraseFrame?: string; rhetoricalFunction?: string; register?: string; confusables?: string[] }
     >;
     keySentence?: import("@/lib/types").KeySentence;
     passageMeta?: { contentType: string; sceneTopic: string };
@@ -578,7 +578,7 @@ export default function Page() {
     let meanings:
       | Record<
           string,
-          { meaningZh: string; translationZh?: string; phonetic?: string; morphology?: string; partOfSpeech: string; collocation: string }
+          { meaningZh: string; translationZh?: string; phonetic?: string; morphology?: string; partOfSpeech: string; collocation: string; phraseFrame?: string; rhetoricalFunction?: string; register?: string; confusables?: string[] }
         >
       | undefined;
     let generatedBy: "ai" | "local" = "local";
@@ -634,6 +634,10 @@ export default function Page() {
                 morphology: item.morphology,
               partOfSpeech: item.partOfSpeech,
               collocation: item.collocation,
+              phraseFrame: item.phraseFrame,
+              rhetoricalFunction: item.rhetoricalFunction,
+              register: item.register,
+              confusables: item.confusables,
             },
           ]),
         );
@@ -2565,6 +2569,10 @@ function renderEnglish(
                   <span>词性：{target.partOfSpeech && target.partOfSpeech !== "word" ? formatPartOfSpeech(target.partOfSpeech) : "暂无"}</span>
                   <span>词根词缀：{target.morphology || "暂无可靠拆解"}</span>
                   <span>搭配：{target.collocation}</span>
+                  {target.phraseFrame && <span>词块框架：{target.phraseFrame}</span>}
+                  {target.rhetoricalFunction && <span>修辞功能：{target.rhetoricalFunction}</span>}
+                  {target.register && <span>语域：{target.register}</span>}
+                  {target.confusables?.length ? <span>易混词：{target.confusables.join("、")}</span> : null}
                 </span>
               )}
             </span>

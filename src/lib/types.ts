@@ -70,6 +70,10 @@ export interface ContextWordUse {
   morphology?: string;
   partOfSpeech: string;
   collocation: string;
+  phraseFrame?: string;
+  rhetoricalFunction?: string;
+  register?: string;
+  confusables?: string[];
   sentenceIndex: number;
 }
 

@@ -246,7 +246,7 @@ export interface PackMeta {
   /** 中文全文翻译（AI 生成时提供）。 */
   translation?: string;
   /** 按小写词元索引的逐词释义。 */
-  meanings?: Record<string, { meaningZh: string; translationZh?: string; phonetic?: string; morphology?: string; partOfSpeech: string; collocation: string }>;
+  meanings?: Record<string, { meaningZh: string; translationZh?: string; phonetic?: string; morphology?: string; partOfSpeech: string; collocation: string; phraseFrame?: string; rhetoricalFunction?: string; register?: string; confusables?: string[] }>;
   /** 关键句型（AI 生成时提供，缺省时本地自动挑选）。 */
   keySentence?: KeySentence;
   /** 短文标题（缺省用演示标题）。 */
@@ -280,6 +280,10 @@ export function makePack(words: string[], passage: string, now = isoNow(), maxWo
       morphology: meaning?.morphology,
       partOfSpeech: meaning?.partOfSpeech ?? "word",
       collocation: meaning?.collocation ?? `use ${lemma} in context`,
+      phraseFrame: meaning?.phraseFrame,
+      rhetoricalFunction: meaning?.rhetoricalFunction,
+      register: meaning?.register,
+      confusables: meaning?.confusables,
       sentenceIndex: index % Math.max(sentenceList.length, 1),
     };
   });
