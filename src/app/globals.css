@@ -1585,6 +1585,31 @@ input[type="text"]:focus {
   color: var(--muted);
   font-size: 12px;
 }
+/* 可解释路由器给出的“本次练习原因” */
+.review-reason {
+  margin-top: 8px;
+  padding: 7px 11px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: #15584f;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.review-hint {
+  margin-top: 12px;
+  padding: 10px 13px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent-soft) 70%, white);
+  color: var(--ink);
+}
+.review-hint span {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+}
+.review-hint p { margin: 4px 0 0; }
 .review-session {
   max-width: 800px;
   margin: 0 auto;

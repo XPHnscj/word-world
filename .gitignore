@@ -11,6 +11,7 @@
 /data/*.sqlite
 /data/*.sqlite-shm
 /data/*.sqlite-wal
+/data/backups/
 
 # local files
 .env*

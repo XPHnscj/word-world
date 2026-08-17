@@ -5,7 +5,9 @@ import Image from "next/image";
 import { useLiveQuery } from "dexie-react-hooks";
 import {
   DEMO_LEMMAS,
+  appendEvidenceServer,
   ensurePersistentStorage,
+  flushPendingEvidence,
   isoNow,
   learningDB,
   makePack,
@@ -19,8 +21,8 @@ import {
   toggleWordKnown,
   writeServerSnapshot,
 } from "@/lib/db";
-import type { ContextPack, ReviewEvaluation, ReviewPhase, ReviewRating, ReviewTask, UserWordbook, WordCard } from "@/lib/types";
-import { adaptiveSchedule, buildAdaptiveQueue, getMasteryLevel, localEvaluateSentence, nextLevel, phaseForLevel, phaseLabel } from "@/lib/reviewEngine";
+import type { CapabilityDimension, ContextPack, HintLevel, LearningEvidence, ReviewEvaluation, ReviewPhase, ReviewRating, ReviewTask, UserWordbook, WordCard } from "@/lib/types";
+import { adaptiveSchedule, applyDimensionEvidence, buildAdaptiveQueue, capabilitiesOf, CAPABILITY_DIMENSIONS, emptyDimensionState, getMasteryLevel, nextLevel, phaseForLevel, phaseLabel, routeNextTask } from "@/lib/reviewEngine";
 import { makeReviewDemoBundle } from "@/lib/reviewDemo";
 import {
   loadBuiltinVocab,
@@ -28,6 +30,7 @@ import {
   type IeltsEntry,
 } from "@/lib/ieltsVocab";
 import { countEnglishWords, findDuplicateTarget, findMissingTargets, findMissingTranslationAnnotations, hasCompleteTranslationAnnotations, normalizeTranslationChunk, parseContextPack } from "@/lib/contextPack";
+import { TASK_SPECS, hintForLevel } from "@/lib/reviewTasks";
 import { TodayView } from "./components/TodayView";
 import { ProgressView } from "./components/ProgressView";
 import { StatisticsView } from "./components/StatisticsView";
@@ -237,6 +240,12 @@ export default function Page() {
   const [reviewCard, setReviewCard] = useState<WordCard | null>(null);
   const [reviewTask, setReviewTask] = useState<ReviewTask>("meaning");
   const [reviewPhase, setReviewPhase] = useState<ReviewPhase>("recognition");
+  /** 可解释路由器给出的“本次练习原因”（复习页一行小字）。 */
+  const [reviewReason, setReviewReason] = useState<string | null>(null);
+  /** 路由器选定的能力维度（决定任务库的提示阶梯与离线判定）。 */
+  const [reviewDimension, setReviewDimension] = useState<CapabilityDimension>("meaningRecall");
+  /** 动态提示阶梯层级 0-5（0=无提示）。 */
+  const [reviewHintLevel, setReviewHintLevel] = useState<HintLevel>(0);
   const [reviewQueueCards, setReviewQueueCards] = useState<WordCard[]>([]);
   const [reviewInput, setReviewInput] = useState("");
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -404,6 +413,7 @@ export default function Page() {
   }, []);
   useEffect(() => {
     void ensurePersistentStorage();
+    void flushPendingEvidence();
   }, []);
   useEffect(() => {
     const stored = window.localStorage.getItem("ielts-context-completed-days");
@@ -830,9 +840,68 @@ export default function Page() {
     );
   };
 
+  /** 构建一条学习证据（任务结果 → 不可变记录，增量写入 SQLite）。 */
+  const makeEvidence = (
+    lemma: string,
+    dimension: CapabilityDimension,
+    taskType: string,
+    correct: boolean,
+    score: number,
+    opts: { hintLevel?: HintLevel; confidence?: number } = {},
+  ): LearningEvidence => {
+    const now = Date.now();
+    return {
+      id: `evt_${now.toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      cardId: `card_${lemma}`,
+      dimension,
+      taskType,
+      correct,
+      score,
+      confidence: opts.confidence ?? (correct ? 3 : 2),
+      hintLevel: opts.hintLevel ?? 0,
+      elapsedMs: Math.max(0, now - readingStartedAt),
+      contextId: pack?.id,
+      contextTopic: pack?.topic,
+      evaluator: "local",
+      createdAt: new Date(now).toISOString(),
+    };
+  };
+
+  /**
+   * 记录一批学习证据：增量写入 SQLite，并把客观任务结果应用到已存在词卡的能力状态。
+   * 曝光（read）与主观跳过（skip-known）只记录、不参与能力计算（避免“看过=掌握”）。
+   */
+  const recordEvidenceBatch = async (events: LearningEvidence[]) => {
+    if (!events.length) return;
+    void appendEvidenceServer(events);
+    for (const event of events) {
+      if (event.taskType === "read" || event.taskType === "skip-known") continue;
+      const card = await learningDB.cards.get(event.cardId);
+      if (!card) continue;
+      const capabilities = capabilitiesOf(card);
+      const next = applyDimensionEvidence(
+        capabilities[event.dimension],
+        event,
+        new Date(event.createdAt).getTime(),
+      );
+      await learningDB.cards.update(card.id, {
+        capabilities: { ...capabilities, [event.dimension]: next },
+        updatedAt: isoNow(),
+      });
+    }
+  };
+
   /** 切换一个词的“已经会了”状态：橙色跳过，不再出现在新短文。 */
-  const toggleSkipWord = (lemma: string) => {
-    void toggleWordKnown(lemma);
+  const toggleSkipWord = async (lemma: string) => {
+    const nowKnown = await toggleWordKnown(lemma);
+    // 主观“会了”证据：只记录，不作为客观掌握依据。
+    if (nowKnown) {
+      const event = makeEvidence(lemma, "formRecognition", "skip-known", true, 100, {
+        hintLevel: 0,
+        confidence: 5,
+      });
+      void appendEvidenceServer([event]);
+    }
   };
 
   const startReading = (day: number, initialMode: "show" | "spell" = "show") => {
@@ -891,10 +960,41 @@ export default function Page() {
       if (!existing) {
         card.stage = "encountered";
         card.masteryLevel = 1;
+        // 用本次会话的客观拼写结果初始化多维能力状态（完成文章不等于掌握：
+        // 答对只按“使用提示后正确”小幅提升，答错则拼写维度下降；其余维度保持基线）。
+        const capabilities = Object.fromEntries(
+          CAPABILITY_DIMENSIONS.map((dimension) => [dimension, emptyDimensionState()]),
+        ) as Record<CapabilityDimension, ReturnType<typeof emptyDimensionState>>;
+        const now = Date.now();
+        const spellResult = spellingResults[use.lemma];
+        if (spellResult === "correct") {
+          capabilities.spelling = applyDimensionEvidence(
+            capabilities.spelling,
+            { correct: true, hintLevel: 2, confidence: 4, elapsedMs: 0 },
+            now,
+          );
+        } else if (spellResult === "wrong") {
+          capabilities.spelling = applyDimensionEvidence(
+            capabilities.spelling,
+            { correct: false, hintLevel: 2, confidence: 1, elapsedMs: 0 },
+            now,
+          );
+        }
+        card.capabilities = capabilities;
       }
       card.updatedAt = isoNow();
       await learningDB.cards.put(card);
     }
+    // 阅读曝光证据：只记录（任务类型 read），不提升任何能力维度。
+    const exposureEvents = pack.targetWords
+      .filter((use) => !knownSet.has(use.lemma))
+      .map((use) =>
+        makeEvidence(use.lemma, "formRecognition", "read", true, 40, {
+          hintLevel: 0,
+          confidence: 2,
+        }),
+      );
+    void recordEvidenceBatch(exposureEvents);
     const completedAt = new Date();
     await learningDB.sessions.add({
       id: `session_${completedAt.getTime().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
@@ -955,6 +1055,16 @@ export default function Page() {
     setSpellingResults(results);
     setSpellingScore(correct);
     setSpellingPassed(correct === checkable.length);
+    // 学习证据：每个可填词生成一条拼写证据（正确/错误分别记录；填词框旁有中文提示，
+    // 因此归为“使用提示后”的结果，hintLevel=2，不记为无提示独立掌握）。
+    const evidence = checkable.map((word) => {
+      const ok = results[word.lemma] === "correct";
+      return makeEvidence(word.lemma, "spelling", "spell", ok, ok ? 100 : 0, {
+        hintLevel: 2,
+        confidence: ok ? 4 : 1,
+      });
+    });
+    void recordEvidenceBatch(evidence);
     window.requestAnimationFrame(() => {
       if (correct === checkable.length) {
         playSpellingOutcome("success", aiSettings.typingSound);
@@ -987,7 +1097,11 @@ export default function Page() {
     if (card) {
       const phase = phaseForLevel(getMasteryLevel(card));
       setReviewPhase(phase);
-      setReviewTask(taskForPhase(phase));
+      const route = routeNextTask(card, attempts.filter((attempt) => attempt.cardId === card.id));
+      setReviewTask(route.task);
+      setReviewReason(route.reason);
+      setReviewDimension(route.dimension);
+      setReviewHintLevel(0);
     }
     setReviewInput("");
     setFeedback(null);
@@ -1012,35 +1126,43 @@ export default function Page() {
     beginReview(buildAdaptiveQueue(demoCards, attempts, Date.now(), 30));
   };
   const evaluateReviewAnswer = async () => {
-    if (!reviewCard || !reviewInput.trim() || (reviewPhase !== "generation" && reviewPhase !== "transfer")) return;
+    if (!reviewCard || !reviewInput.trim()) return;
     setReviewEvaluating(true);
-    const local = localEvaluateSentence(reviewCard.lemma, reviewInput);
-    setReviewEvaluation({ ...local, source: "local" });
-    try {
-      const response = await fetch("/api/reviews/evaluate", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          lemma: reviewCard.lemma,
-          answer: reviewInput,
-          phase: reviewPhase,
-          meaningZh: reviewCard.meaningZh,
-          sceneTopic: reviewPhase === "transfer" ? migrationTopic(reviewCard, reviewCard.correct) : "日常具体情境",
-          ...aiSettings,
-        }),
-      });
-      const payload = (await response.json()) as { evaluation?: ReviewEvaluation };
-      if (payload.evaluation) setReviewEvaluation(payload.evaluation);
-    } catch {
-      // 本地初筛结果已经可以继续复习。
-    } finally {
-      setReviewEvaluating(false);
-      setReviewRevealed(true);
+    const spec = TASK_SPECS[reviewDimension];
+    const local = spec.judge(reviewCard, reviewInput);
+    setReviewEvaluation({
+      passed: local.correct,
+      score: local.score,
+      feedback: local.correct ? "本地检查通过，可以继续评价这次记忆状态。" : "还没有达到当前任务的最低要求，可以查看提示后再试。",
+      source: "local",
+    });
+    // 只有主动造句和跨语境迁移需要 AI 做自然度补充判断，其余任务保持离线可用。
+    if ((reviewDimension === "production" || reviewDimension === "transfer") && aiSettings.apiKey) {
+      try {
+        const response = await fetch("/api/reviews/evaluate", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            lemma: reviewCard.lemma,
+            answer: reviewInput,
+            phase: reviewPhase,
+            meaningZh: reviewCard.meaningZh,
+            sceneTopic: reviewDimension === "transfer" ? migrationTopic(reviewCard, reviewCard.correct) : "日常具体情境",
+            ...aiSettings,
+          }),
+        });
+        const payload = (await response.json()) as { evaluation?: ReviewEvaluation };
+        if (payload.evaluation) setReviewEvaluation(payload.evaluation);
+      } catch {
+        // 本地初筛结果已经可以继续复习。
+      }
     }
+    setReviewEvaluating(false);
+    setReviewRevealed(true);
   };
   const chooseReviewRating = (rating: ReviewRating) => {
     if (!reviewCard) return;
-    if (rating === "known" && (reviewPhase === "generation" || reviewPhase === "transfer") && !reviewEvaluation?.passed) {
+    if (rating === "known" && !reviewEvaluation?.passed) {
       setFeedback("先完成一句包含目标词的自然表达；模型通过后才能升级。你也可以选择“模糊”或“忘记”。");
       return;
     }
@@ -1051,7 +1173,7 @@ export default function Page() {
     if (!reviewCard || !pendingReviewRating) return;
     const rating = pendingReviewRating;
     const reviewedAt = isoNow();
-    const evaluationPassed = reviewPhase === "generation" || reviewPhase === "transfer" ? Boolean(reviewEvaluation?.passed) : true;
+    const evaluationPassed = Boolean(reviewEvaluation?.passed);
     const level = getMasteryLevel(reviewCard);
     const promotedLevel = nextLevel(level, rating, reviewPhase, evaluationPassed);
     const nextSchedule = adaptiveSchedule(reviewCard.schedule, level, rating, reviewedAt);
@@ -1076,18 +1198,45 @@ export default function Page() {
       ...updated.dimensions,
       [dimension]: Math.min(100, updated.dimensions[dimension] + (rating === "known" ? 18 : rating === "fuzzy" ? 6 : 0)),
     };
+    // 复习证据：增量写入 SQLite，并按路由器维度更新多维能力状态。
+    const reviewEvidence: LearningEvidence = {
+      id: `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      cardId: updated.id,
+      dimension: reviewDimension,
+      taskType: reviewTask,
+      correct,
+      score: rating === "known" ? 100 : rating === "fuzzy" ? 50 : 0,
+      confidence: rating === "known" ? 4 : rating === "fuzzy" ? 2 : 1,
+      hintLevel: reviewHintLevel,
+      elapsedMs: Math.max(0, Date.now() - reviewStartedAt),
+      contextId: pack?.id,
+      contextTopic: reviewPhase === "transfer" ? migrationTopic(reviewCard, reviewCard.correct) : "复习会话",
+      evaluator: reviewEvaluation?.source ?? "local",
+      createdAt: reviewedAt,
+    };
+    void appendEvidenceServer([reviewEvidence]);
+    const currentCaps = capabilitiesOf(updated);
+    updated.capabilities = {
+      ...currentCaps,
+      [reviewDimension]: applyDimensionEvidence(
+        currentCaps[reviewDimension],
+        reviewEvidence,
+        new Date(reviewedAt).getTime(),
+      ),
+    };
     await learningDB.cards.put(updated);
     await learningDB.attempts.add({
       id: `attempt_${Date.now()}`,
       cardId: updated.id,
       task: reviewTask,
       correct,
-      hintLevel: rating === "fuzzy" ? 1 : 0,
+      hintLevel: reviewHintLevel,
       confidence: rating === "known" ? 4 : rating === "fuzzy" ? 2 : 1,
       elapsedMs: Math.max(0, Date.now() - reviewStartedAt),
       reviewedAt,
       rating,
       phase: reviewPhase,
+      dimension: reviewDimension,
       answer: reviewInput.trim() || undefined,
       evaluation: reviewEvaluation ?? undefined,
     });
@@ -1107,7 +1256,11 @@ export default function Page() {
       setReviewCard(nextCard);
       const nextPhase = phaseForLevel(getMasteryLevel(nextCard));
       setReviewPhase(nextPhase);
-      setReviewTask(taskForPhase(nextPhase));
+      const nextRoute = routeNextTask(nextCard, attempts.filter((attempt) => attempt.cardId === nextCard.id));
+      setReviewTask(nextRoute.task);
+      setReviewReason(nextRoute.reason);
+      setReviewDimension(nextRoute.dimension);
+      setReviewHintLevel(0);
       setReviewStartedAt(Date.now());
     } else {
       setReviewCard(null);
@@ -1173,9 +1326,6 @@ export default function Page() {
     setTab("today");
     setToast({ message: "系统已完全重置，所有学习日均恢复为未生成状态。" });
   };
-
-  const taskForPhase = (phase: ReviewPhase): ReviewTask =>
-    phase === "recognition" ? "cloze" : phase === "semantic" ? "meaning" : phase === "generation" ? "sentence" : "transfer";
 
   if (!storageReady) {
     return (
@@ -1284,6 +1434,10 @@ export default function Page() {
           <Review
             card={reviewCard}
             phase={reviewPhase}
+            reason={reviewReason}
+            dimension={reviewDimension}
+            hintLevel={reviewHintLevel}
+            onHint={() => setReviewHintLevel((level) => Math.min(5, level + 1) as HintLevel)}
             input={reviewInput}
             setInput={setReviewInput}
             feedback={feedback}
@@ -2484,18 +2638,6 @@ function migrationTopic(card: Pick<WordCard, "transferTopics" | "sourceTitle"> ,
     ?? MIGRATION_TOPICS[Math.abs(seed) % MIGRATION_TOPICS.length];
 }
 
-function migrationPrompt(lemma: string, topic: string) {
-  const prompts: Record<string, string> = {
-    "摄影现场": `Describe a photography scene where you could naturally use “${lemma}”.`,
-    "商业会议": `Write one sentence about a business meeting where “${lemma}” fits naturally.`,
-    "校园课堂": `Describe a classroom moment where “${lemma}” helps explain what happened.`,
-    "科技产品": `Describe a technology scene where “${lemma}” would be a natural word choice.`,
-    "公共服务": `Write one sentence about a public service situation where “${lemma}” fits naturally.`,
-    "旅行途中": `Describe a travel moment where “${lemma}” would naturally describe the scene.`,
-  };
-  return prompts[topic] ?? `Describe a new situation where you could naturally use “${lemma}”.`;
-}
-
 function reviewRiskLabel(card: Pick<WordCard, "schedule" | "lapses">) {
   const overdue = card.schedule.nextDueAt
     ? Date.now() - new Date(card.schedule.nextDueAt).getTime()
@@ -2508,6 +2650,10 @@ function reviewRiskLabel(card: Pick<WordCard, "schedule" | "lapses">) {
 function Review({
   card,
   phase,
+  reason,
+  dimension,
+  hintLevel,
+  onHint,
   input,
   setInput,
   feedback,
@@ -2526,6 +2672,10 @@ function Review({
 }: {
   card: WordCard | null;
   phase: ReviewPhase;
+  reason: string | null;
+  dimension: CapabilityDimension;
+  hintLevel: number;
+  onHint: () => void;
   input: string;
   setInput: (v: string) => void;
   feedback: string | null;
@@ -2567,13 +2717,10 @@ function Review({
   const level = getMasteryLevel(card);
   const topic = migrationTopic(card, card.correct);
   const englishDefinition = definitionEn ?? "an English meaning is not available for this imported word yet";
-  const prompt = phase === "recognition"
-    ? `先回到原来的场景，你还记得 “${card.lemma}” 在这里表达什么吗？`
-    : phase === "semantic"
-      ? `理解这个词：${card.lemma}`
-      : phase === "generation"
-        ? `Describe a situation where you could naturally use “${card.lemma}”.`
-        : migrationPrompt(card.lemma, topic);
+  const spec = TASK_SPECS[dimension];
+  const prompt = spec.prompt(card);
+  const hint = hintForLevel(spec, card, hintLevel);
+  const needsAnswer = true;
   const ratingOptions: Array<{ rating: ReviewRating; label: string; note: string }> = [
     { rating: "known", label: "认识", note: "我能理解并调用" },
     { rating: "fuzzy", label: "模糊", note: "有印象但不稳定" },
@@ -2599,30 +2746,46 @@ function Review({
           ? new Date(card.schedule.nextDueAt).toLocaleDateString("zh-CN")
           : "待安排"}
       </p>
+      {reason && (
+        <p className="review-reason" role="note">
+          本次练习原因：{reason}
+        </p>
+      )}
       <h1 className="review-prompt-title">{prompt}</h1>
-      {phase === "recognition" && context && (
+      {phase === "recognition" && context && dimension === "formRecognition" && (
         <p className="small muted" style={{ marginTop: 10 }}>
           原始语境：{context}
         </p>
       )}
-      {phase === "semantic" && (
+      {dimension === "meaningRecall" && (
         <div className="semantic-definition">
           <span>English meaning</span>
           <strong>{englishDefinition}</strong>
           <small>暂不显示中文，先判断你是否能从英文释义理解它。</small>
         </div>
       )}
-      {(phase === "generation" || phase === "transfer") && (
+      {hint && (
+        <div className="review-hint" role="note">
+          <span>提示 {hintLevel} · {hint.label}</span>
+          <p>{hint.content}</p>
+        </div>
+      )}
+      {!hint && hintLevel < spec.hintLadder.length && (
+        <button type="button" className="button button-quiet" style={{ marginTop: 12 }} onClick={onHint}>
+          查看第 {hintLevel + 1} 级提示
+        </button>
+      )}
+      {(needsAnswer) && (
         <>
-          {phase === "transfer" && <span className="review-topic-chip">迁移场景 · {topic}</span>}
+          {dimension === "transfer" && <span className="review-topic-chip">迁移场景 · {topic}</span>}
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="写一句完整、自然的英文句子……"
+            placeholder={dimension === "spelling" ? "输入英文拼写……" : dimension === "meaningRecall" || dimension === "formRecognition" || dimension === "fluency" ? "写出你想到的中文含义……" : "写一句完整、自然的英文表达……"}
             className="review-answer-input"
             disabled={Boolean(evaluation)}
           />
-          {!evaluation && <button className="button" style={{ marginTop: 14 }} onClick={onEvaluate} disabled={!input.trim() || evaluating}>{evaluating ? "正在检查表达…" : "检查这句话"}</button>}
+          {!evaluation && <button className="button" style={{ marginTop: 14 }} onClick={onEvaluate} disabled={!input.trim() || evaluating}>{evaluating ? "正在检查…" : "检查答案"}</button>}
           {evaluation && (
             <div className={`review-evaluation ${evaluation.passed ? "passed" : "failed"}`}>
               <strong>{evaluation.passed ? "表达自然度通过" : "还需要调整"} · {evaluation.score}分</strong>
@@ -2641,7 +2804,7 @@ function Review({
               key={option.rating}
               className={`rating-option rating-${option.rating} ${pendingRating === option.rating ? "selected" : ""}`}
               onClick={() => onRate(option.rating)}
-              disabled={phase === "generation" || phase === "transfer" ? !evaluation : false}
+              disabled={needsAnswer ? !evaluation : false}
             >
               <strong>{option.label}</strong>
               <small>{option.note}</small>

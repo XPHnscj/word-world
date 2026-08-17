@@ -1,9 +1,59 @@
 import Dexie, { type Table } from "dexie";
-import type { ContextPack, ContextTask, KeySentence, ReviewAttempt, ScheduleState, StudySession, UserWordbook, WordCard } from "./types";
+import type { ContextPack, ContextTask, KeySentence, LearningEvidence, ReviewAttempt, ScheduleState, StudySession, UserWordbook, WordCard } from "./types";
 import type { StorageSnapshot } from "./storageTypes";
 
 /** packs 必须索引 planDay，重新生成时才能按学习日原子替换旧短文。 */
 export const PACKS_SCHEMA = "id, createdAt, planDay";
+
+const PENDING_EVIDENCE_KEY = "ielts-context-pending-evidence";
+
+function readPendingEvidence(): LearningEvidence[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(PENDING_EVIDENCE_KEY) ?? "[]");
+    return Array.isArray(parsed) ? (parsed as LearningEvidence[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function queuePendingEvidence(events: LearningEvidence[]) {
+  if (typeof window === "undefined" || !events.length) return;
+  const merged = [...readPendingEvidence(), ...events].slice(-500);
+  try {
+    window.localStorage.setItem(PENDING_EVIDENCE_KEY, JSON.stringify(merged));
+  } catch {
+    // 存储空间不足时不阻塞当前学习流程；服务端可用时下一次请求仍会继续尝试。
+  }
+}
+
+/** 把学习证据增量追加到项目 SQLite；失败时先落到本机队列，避免短暂离线丢失。 */
+export async function appendEvidenceServer(events: LearningEvidence[]): Promise<void> {
+  if (!events.length) return;
+  await sendEvidence([...readPendingEvidence(), ...events].slice(-500));
+}
+
+async function sendEvidence(pending: LearningEvidence[]): Promise<void> {
+  if (!pending.length) return;
+  try {
+    const response = await fetch("/api/storage/events", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ events: pending }),
+    });
+    if (!response.ok) throw new Error(`evidence request failed: ${response.status}`);
+    if (typeof window !== "undefined") window.localStorage.removeItem(PENDING_EVIDENCE_KEY);
+  } catch {
+    queuePendingEvidence(pending);
+  }
+}
+
+/** 应用启动或恢复网络时，将短暂离线期间积累的证据补写进 SQLite。 */
+export async function flushPendingEvidence(): Promise<void> {
+  const pending = readPendingEvidence();
+  if (!pending.length) return;
+  await sendEvidence(pending);
+}
 
 class LearningDB extends Dexie {
   cards!: Table<WordCard, string>;
