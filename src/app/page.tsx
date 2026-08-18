@@ -35,6 +35,7 @@ import {
   parseExternalWords,
 } from "@/lib/externalVocabulary";
 import { countEnglishWords, findDuplicateTarget, findMissingTargets, findMissingTranslationAnnotations, hasCompleteTranslationAnnotations, normalizeTranslationChunk, parseContextPack } from "@/lib/contextPack";
+import type { GenerationRepairIssues } from "@/lib/generationRepair";
 import { buildLocalPassage } from "@/lib/localPassage";
 import { TodayView } from "./components/TodayView";
 import { ProgressView } from "./components/ProgressView";
@@ -569,7 +570,6 @@ export default function Page() {
     startReading(day, entry.kind === "review" ? "spell" : "show");
     setActivePlanEntry(entry);
     setTab("read");
-
     if (dayPack?.generatedBy === "local" && dayPack.planDay === day) {
       void refreshLegacyLocalPack(dayPack, day);
     }
@@ -627,7 +627,9 @@ export default function Page() {
     } finally {
       setGenerating(false);
     }
-  };  /**
+  };
+
+  /**
    * 用给定词列表在后台生成当天短文并归档到 selectedDay。
    * 生成期间按钮显示“正在生成请稍后…”，完成后弹出通知条（可一键查看），
    * 不会打断用户当前所在的页面。
@@ -757,6 +759,7 @@ export default function Page() {
     let modeNote = "本地模板短文（未配置 AI 或生成失败，可稍后重试）";
 
     const first = await streamAIText(words, adjustment, "", onProgress);
+    let draftText = first.text;
     let parsed = first.text ? parseContextPack(first.text, words) : undefined;
     if (parsed?.passage) {
       // 质量门：重复目标词、明显超长、漏词、或逐词中文翻译标注不完整时重写。
@@ -769,21 +772,23 @@ export default function Page() {
         const missing = findMissingTargets(candidate, words);
         const missingAnnotations = findMissingTranslationAnnotations(parsed.translation, parsed.meanings, words);
         if (!duplicated && !tooLong && missing.length === 0 && missingAnnotations.length === 0) break;
-        const retryParts = [
+        const issues: GenerationRepairIssues = {
+          tooLong,
+          duplicateWord: duplicated ?? undefined,
+          missingWords: missing,
+          missingAnnotations,
+        };
+        const retry = await streamAIText(
+          words,
           adjustment,
-          tooLong ? "上一版明显过长。请写成约 75-95 个英文词、4-6 句，最多不超过 110 词。" : "",
-          missing.length ? `上一版遗漏或改变了这些目标词的词形：${missing.join(", ")}。正文必须逐字使用其原形各一次，保证每个词都能生成一个填词框。` : "",
-          missingAnnotations.length
-            ? attempt === 0
-              ? `上一版中文翻译或逐词标注不完整，以下词的标注无法在 translation 中逐字定位：${missingAnnotations.join("、")}。请打开你刚写的 translation，找到每个词对应的连续中文片段并原样复制为 translationZh（例如 translation 中是“准确读数”，translationZh 就写“准确读数”，不要写词典义“准确的”）。`
-              : `翻译仍不完整：再次核对 ${missingAnnotations.join("、")}。先写完整中文翻译，再从翻译中逐字复制每个目标词对应的连续片段作为 translationZh；禁止改写、增删字词、加括号或引号、换用同义词。`
-            : "",
-          "将目标词分散到自然句子中，禁止用逗号连续罗列。",
-        ].filter(Boolean).join("；");
-        const retry = await streamAIText(words, retryParts, duplicated ?? "", onProgress);
+          duplicated ?? "",
+          onProgress,
+          draftText ? { previousDraft: draftText, issues } : undefined,
+        );
         if (!retry.text) break;
         const retried = parseContextPack(retry.text, words);
         if (!retried.passage) break;
+        draftText = retry.text;
         parsed = retried;
       }
       const candidatePassage = parsed.passage;
@@ -818,7 +823,16 @@ export default function Page() {
         generatedBy = "ai";
         modeNote = `AI 已生成短文、翻译与逐词释义 · ${countEnglishWords(passage)} 词`;
       } else {
-        modeNote = "AI 两次输出仍有超长、重复、漏词或翻译标注不完整，已改用本地场景短文";
+        const finalMissing = findMissingTargets(candidatePassage ?? "", words);
+        const finalDuplicate = findDuplicateTarget(candidatePassage ?? "", words);
+        const finalAnnotations = findMissingTranslationAnnotations(parsed.translation, parsed.meanings, words);
+        const reasons = [
+          !isCompact ? "正文超过 110 词" : "",
+          finalDuplicate ? `重复词：${finalDuplicate}` : "",
+          finalMissing.length ? `漏词/变形：${finalMissing.join("、")}` : "",
+          finalAnnotations.length ? `中文定位未通过：${finalAnnotations.join("、")}` : "",
+        ].filter(Boolean);
+        modeNote = `AI 修补后仍未通过质量校验（${reasons.join("；")}），已保留本地场景短文`;
       }
     } else if (first.warning) {
       modeNote = first.warning;
@@ -852,6 +866,7 @@ export default function Page() {
     adjustment: string,
     fixDuplicate: string,
     onProgress?: (chars: number) => void,
+    repairContext?: { previousDraft: string; issues: GenerationRepairIssues },
   ): Promise<{ text: string | null; warning?: string }> => {
     try {
       const response = await fetch("/api/context-packs/generate", {
@@ -863,6 +878,8 @@ export default function Page() {
           planning: aiSettings.planning,
           adjustment: adjustment || undefined,
           fixDuplicate: fixDuplicate || undefined,
+          previousDraft: repairContext?.previousDraft,
+          repair: repairContext?.issues,
           model: aiSettings.model,
           baseUrl: aiSettings.baseUrl,
           apiKey: aiSettings.apiKey,

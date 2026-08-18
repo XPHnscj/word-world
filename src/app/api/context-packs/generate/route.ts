@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
 import { normalizeClientProviderUrl, trustedServerProviderUrl } from "@/lib/provider";
 import type { WordMeta } from "@/lib/contextPack";
+import { buildGenerationRepairPrompt, mergeGenerationRepairDraft, normalizeGenerationRepairIssues, resolveGenerationTargetMarkers } from "@/lib/generationRepair";
 import { readServerAIEnv } from "@/lib/serverConfig";
 
 export interface GenerateResult {
@@ -57,6 +59,10 @@ export async function POST(request: Request): Promise<Response> {
   /** 客户端检测到目标词重复后要求重写时传入的重复词。 */
   const fixDuplicate =
     typeof body.fixDuplicate === "string" ? body.fixDuplicate.trim().slice(0, 60) : "";
+  const repairIssues = normalizeGenerationRepairIssues(body.repair, words);
+  const previousDraft = repairIssues && typeof body.previousDraft === "string"
+    ? body.previousDraft.trim().slice(0, 16_000)
+    : "";
   const env = readServerAIEnv();
   const serverApiKey = env.apiKey;
   const serverConfigured = Boolean(serverApiKey);
@@ -111,7 +117,10 @@ export async function POST(request: Request): Promise<Response> {
 
   // 缓存命中：把整篇文本作为单个流式块返回，客户端无需等待模型。
   // 提示结构升级时更换版本，避免进程内复用缺少译文定位/真实主题的旧结果。
-  const cacheKey = ["v5-lexical-annotations", words.join(","), planning, adjustment, fixDuplicate, model, protocol].join("\u0001");
+  const draftFingerprint = previousDraft
+    ? createHash("sha256").update(previousDraft).digest("hex").slice(0, 16)
+    : "";
+  const cacheKey = ["v10-compact-repair", words.join(","), planning, adjustment, fixDuplicate, draftFingerprint, model, protocol].join("\u0001");
   const cached = readGenerationCache(cacheKey);
   if (cached !== null) {
     return streamingResult(cached);
@@ -124,7 +133,7 @@ export async function POST(request: Request): Promise<Response> {
   const duplicateInstruction = fixDuplicate
     ? `\n（重要）上一版短文中目标词 "${fixDuplicate}" 重复出现了。请重写：每个目标词必须且只能出现一次，同一个词禁止出现在两个不同位置。`
     : "";
-  const prompt = `你是一名 IELTS Writing 教研编辑。制作一份记忆词汇兼积累论证语言的语境学习包。${planningInstruction}。${adjustmentInstruction}${duplicateInstruction}
+  const initialPrompt = `你是一名 IELTS Writing 教研编辑。制作一份记忆词汇兼积累论证语言的语境学习包。${planningInstruction}。${adjustmentInstruction}${duplicateInstruction}
 短文必须落在一个具体、可想象的瞬间：交代地点、人物动作和至少一个视觉或听觉细节，让读者脑中出现画面；再从这个场景自然推进到一个观点，不能写成松散例句或抽象口号。自然使用以下每个目标词，且每个目标词只能出现一次：${words.join(", ")}。
 连贯性优先于辞藻。先确定一个现实中可信的核心事件，所有句子必须围绕同一人物、地点和任务，并按“发生了什么 → 为什么 → 导致什么/人物如何认识”的时间或因果顺序推进。每一句都必须能回答它与前一句的关系。
 禁止为了容纳单词突然切换场景或议题；禁止把 garden、kitchen、desk 等普通地点随意写成 kingdom、jungle、weapon 等象征；禁止没有上下文依据的拟人、宏大隐喻、抽象名词堆叠和故作深刻的结论。目标词若语义跨度大，应通过一个合理任务连接（例如人物先完成现场工作，再整理相关报告），不要强行把不相干概念写成比喻。
@@ -145,6 +154,9 @@ export async function POST(request: Request): Promise<Response> {
   "keySentence": { "sentence": "主动写入正文、最值得仿写的高级完整原句（必须与 passage 逐字一致）", "pattern": "用公式拆解主干、从句功能与可替换槽位，禁止只写‘复合句’", "explanation": "讲清语法规则、表达效果、仿写方法，并给一个适用于 Task 2 的简短替换示例", "writingTopic": "该句式真正可迁移的 IELTS 写作领域；若只是通用叙事句则写‘通用表达’，不得根据场景地点臆测话题" }
 }
 中文翻译约定（必须遵守）：先写完整的 translation 覆盖正文每一句，再从 translation 中逐字复制每个目标词对应的连续中文片段作为其 translationZh；禁止改写、增删字词、加括号或引号、换用同义词，否则该词的中文划线将无法与全文对应。示例：若 translation 中含“准确读数”，accurate 的 translationZh 应写“准确读数”，不得写词典义“准确的”。`;
+  const prompt = previousDraft && repairIssues
+    ? buildGenerationRepairPrompt(words, previousDraft, repairIssues, adjustment)
+    : initialPrompt;
   try {
     const endpoint = protocol === "openai_responses" ? "responses" : "chat/completions";
     // Qwen 3.7/3.6/3.5 默认开启思考，必须使用其官方的顶层 enable_thinking=false。
@@ -196,8 +208,14 @@ export async function POST(request: Request): Promise<Response> {
         } catch {
           // 流中断：把已收到的部分作为结果返回，客户端解析失败会走本地回退。
         } finally {
-          writeGenerationCache(cacheKey, text);
-          controller.enqueue(encoder.encode(JSON.stringify({ type: "done", text }) + "\n"));
+          const mergedRepair = previousDraft && repairIssues
+            ? mergeGenerationRepairDraft(previousDraft, text, words)
+            : undefined;
+          const finalText = previousDraft && repairIssues
+            ? resolveGenerationTargetMarkers(mergedRepair ?? text, words)
+            : text;
+          writeGenerationCache(cacheKey, finalText);
+          controller.enqueue(encoder.encode(JSON.stringify({ type: "done", text: finalText }) + "\n"));
           controller.close();
         }
       },
