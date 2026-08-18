@@ -99,7 +99,8 @@ export interface ContextPack {
   id: string;
   title: string;
   topic: string;
-  difficulty: "IELTS standard" | "IELTS advanced";
+  /** 新数据使用通用等级；旧版本的 IELTS 值保留用于兼容已有本地短文。 */
+  difficulty: "standard" | "advanced" | "IELTS standard" | "IELTS advanced";
   passage: string;
   translation: string;
   targetWords: ContextWordUse[];
@@ -110,6 +111,8 @@ export interface ContextPack {
   keySentence?: KeySentence;
   /** 这篇短文对应的学习日（计划表第 N 天）。 */
   planDay?: number;
+  /** 短文所属词书；旧数据缺省时视为内置词书。 */
+  wordbookId?: string;
   /** 短文来源：AI 生成或本地模板。 */
   generatedBy?: "ai" | "local";
   createdAt: string;
@@ -176,12 +179,23 @@ export interface ReviewEvaluation {
   source: "ai" | "local";
 }
 
+/** 词书独立的学习计划与进度，随词书一并持久化。 */
+export interface WordbookPlan {
+  totalVocabulary: number;
+  dailyNewWords: number;
+  targetDays: number;
+  completedDays: number[];
+  completedReviewEntries: string[];
+  updatedAt: string;
+}
+
 /** 用户在本机创建或导入的词书。 */
 export interface UserWordbook {
   id: string;
   name: string;
   words: string;
   createdAt: string;
+  plan?: WordbookPlan;
 }
 
 /** 一次完整的首次学习或艾宾浩斯复习会话。 */

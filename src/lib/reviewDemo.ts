@@ -59,7 +59,7 @@ export function makeReviewDemoBundle(now = new Date()): { cards: WordCard[]; pac
     id: packId,
     title: "随机复习体验",
     topic: "多场景词汇",
-    difficulty: "IELTS standard",
+    difficulty: "standard",
     passage,
     translation,
     targetWords: selected.map((word, index) => ({

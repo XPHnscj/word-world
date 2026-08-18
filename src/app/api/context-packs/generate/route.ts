@@ -72,6 +72,43 @@ export async function POST(request: Request): Promise<Response> {
   const protocol = body.protocol === "openai_responses" ? "openai_responses" : "openai_compatible_chat";
   const extraHeaders = parseExtraHeaders(body.extraHeaders);
 
+  if (body.probe === true) {
+    try {
+      const isQwenProvider = /(^qwen|dashscope|maas\.aliyuncs\.com)/i.test(`${model} ${baseUrl}`);
+      const modelControls = isQwenProvider ? { enable_thinking: false, max_tokens: 8 } : { max_tokens: 8 };
+      const payload = protocol === "openai_responses"
+        ? { model, stream: false, ...modelControls, input: "Reply with OK." }
+        : { model, stream: false, ...modelControls, messages: [{ role: "user", content: "Reply with OK." }] };
+      const upstream = await fetch(`${baseUrl}/${protocol === "openai_responses" ? "responses" : "chat/completions"}`, {
+        method: "POST",
+        headers: { ...extraHeaders, "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!upstream.ok) {
+        const detail = await readUpstreamError(upstream);
+        return NextResponse.json({
+          mode: "local",
+          words,
+          planning,
+          serverConfigured,
+          model,
+          warning: `模型服务返回 HTTP ${upstream.status}${detail ? `：${detail}` : ""}`,
+        });
+      }
+      return NextResponse.json({ mode: "openai", words, planning, serverConfigured, model });
+    } catch (error) {
+      return NextResponse.json({
+        mode: "local",
+        words,
+        planning,
+        serverConfigured,
+        model,
+        warning: `模型服务连接失败：${error instanceof Error ? error.message : "请求超时或网络不可用"}`,
+      });
+    }
+  }
+
   // 缓存命中：把整篇文本作为单个流式块返回，客户端无需等待模型。
   // 提示结构升级时更换版本，避免进程内复用缺少译文定位/真实主题的旧结果。
   const cacheKey = ["v5-lexical-annotations", words.join(","), planning, adjustment, fixDuplicate, model, protocol].join("\u0001");
@@ -125,7 +162,8 @@ export async function POST(request: Request): Promise<Response> {
       signal: AbortSignal.timeout(60_000),
     });
     if (!upstream.ok || !upstream.body) {
-      return NextResponse.json({ mode: "local", words, planning, serverConfigured, model, warning: `AI 请求失败（HTTP ${upstream.status}），已回退本地短文。` });
+      const detail = await readUpstreamError(upstream);
+      return NextResponse.json({ mode: "local", words, planning, serverConfigured, model, warning: `AI 请求失败（HTTP ${upstream.status}${detail ? `：${detail}` : ""}），已回退本地短文。` });
     }
 
     // 边收边转发：客户端立刻能看到生成进度（TTFT 后即可见），避免长时间无反馈。
@@ -214,5 +252,22 @@ function parseExtraHeaders(value: unknown): Record<string, string> {
     ) as Record<string, string>;
   } catch {
     return {};
+  }
+}
+
+async function readUpstreamError(response: Response): Promise<string> {
+  try {
+    const raw = await response.text();
+    const parsed = JSON.parse(raw) as { error?: { message?: unknown } | string; message?: unknown };
+    const message = typeof parsed.error === "string"
+      ? parsed.error
+      : parsed.error && typeof parsed.error === "object" && typeof parsed.error.message === "string"
+        ? parsed.error.message
+        : typeof parsed.message === "string"
+          ? parsed.message
+          : raw;
+    return message.trim().replace(/\s+/g, " ").slice(0, 240);
+  } catch {
+    return "";
   }
 }

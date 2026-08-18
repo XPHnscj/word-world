@@ -3,7 +3,7 @@ import type { ContextPack, ContextTask, KeySentence, LearningEvidence, ReviewAtt
 import type { StorageSnapshot } from "./storageTypes";
 
 /** packs 必须索引 planDay，重新生成时才能按学习日原子替换旧短文。 */
-export const PACKS_SCHEMA = "id, createdAt, planDay";
+export const PACKS_SCHEMA = "id, createdAt, planDay, wordbookId";
 
 const PENDING_EVIDENCE_KEY = "ielts-context-pending-evidence";
 
@@ -70,7 +70,8 @@ class LearningDB extends Dexie {
     this.version(2).stores({ cards: "id, lemma, stage, updatedAt", packs: "id, createdAt", attempts: "id, cardId, reviewedAt", known: "lemma, markedAt" });
     this.version(3).stores({ cards: "id, lemma, stage, updatedAt", packs: "id, createdAt", attempts: "id, cardId, reviewedAt", known: "lemma, markedAt", wordbooks: "id, name, createdAt" });
     this.version(4).stores({ cards: "id, lemma, stage, updatedAt", packs: "id, createdAt", attempts: "id, cardId, reviewedAt", known: "lemma, markedAt", wordbooks: "id, name, createdAt", sessions: "id, sourceDay, scheduleDay, kind, completedAt" });
-    this.version(5).stores({ cards: "id, lemma, stage, updatedAt", packs: PACKS_SCHEMA, attempts: "id, cardId, reviewedAt", known: "lemma, markedAt", wordbooks: "id, name, createdAt", sessions: "id, sourceDay, scheduleDay, kind, completedAt" });
+    this.version(5).stores({ cards: "id, lemma, stage, updatedAt", packs: "id, createdAt, planDay", attempts: "id, cardId, reviewedAt", known: "lemma, markedAt", wordbooks: "id, name, createdAt", sessions: "id, sourceDay, scheduleDay, kind, completedAt" });
+    this.version(6).stores({ cards: "id, lemma, stage, updatedAt", packs: PACKS_SCHEMA, attempts: "id, cardId, reviewedAt", known: "lemma, markedAt", wordbooks: "id, name, createdAt", sessions: "id, sourceDay, scheduleDay, kind, completedAt" });
   }
 }
 
@@ -149,9 +150,13 @@ export function scheduleServerSnapshotSync() {
 }
 
 /** 在同一事务内替换某学习日的短文，失败时保留原文。 */
-export async function replacePackForDay(planDay: number, nextPack: ContextPack): Promise<void> {
+export async function replacePackForDay(planDay: number, nextPack: ContextPack, wordbookId = "builtin-ielts"): Promise<void> {
   await learningDB.transaction("rw", learningDB.packs, async () => {
-    await learningDB.packs.where("planDay").equals(planDay).delete();
+    const existing = await learningDB.packs.where("planDay").equals(planDay).toArray();
+    const ids = existing
+      .filter((pack) => (pack.wordbookId ?? "builtin-ielts") === wordbookId)
+      .map((pack) => pack.id);
+    if (ids.length) await learningDB.packs.bulkDelete(ids);
     await learningDB.packs.put(nextPack);
   });
   scheduleServerSnapshotSync();
@@ -255,6 +260,8 @@ export interface PackMeta {
   topic?: string;
   /** 这篇短文归属的学习日。 */
   planDay?: number;
+  /** 这篇短文所属词书。 */
+  wordbookId?: string;
   /** 短文来源标记。 */
   generatedBy?: "ai" | "local";
 }
@@ -299,7 +306,7 @@ export function makePack(words: string[], passage: string, now = isoNow(), maxWo
   const sentenceNotes = keySentence
     ? [{ sentence: keySentence.sentence, core: keySentence.pattern, translation: keySentence.explanation }]
     : sentenceList.slice(0, 2).map((sentence) => ({ sentence, core: sentence.split(",")[0], translation: "先找出主句谓语，再判断从句与主句之间的逻辑关系。" }));
-  return { id: `pack_${Date.now().toString(36)}`, title: meta?.title ?? "城市适应力与公共政策", topic: meta?.topic ?? "城市与环境", difficulty: "IELTS standard", passage, translation, targetWords, sentenceNotes, tasks, qualityReport: { passed: true, score: 4.7, notes: ["目标词覆盖完整", "文章长度和结构符合标准", "题目答案唯一"] }, keySentence, planDay: meta?.planDay, generatedBy: meta?.generatedBy ?? "local", createdAt: now };
+  return { id: `pack_${Date.now().toString(36)}`, title: meta?.title ?? "城市适应力与公共政策", topic: meta?.topic ?? "城市与环境", difficulty: "standard", passage, translation, targetWords, sentenceNotes, tasks, qualityReport: { passed: true, score: 4.7, notes: ["目标词覆盖完整", "文章长度和结构符合标准", "题目答案唯一"] }, keySentence, planDay: meta?.planDay, wordbookId: meta?.wordbookId, generatedBy: meta?.generatedBy ?? "local", createdAt: now };
 }
 
 function normalizeForMatch(value: string) {

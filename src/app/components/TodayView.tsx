@@ -10,6 +10,7 @@ import {
 type DayRange = { label: string; start: number; end: number };
 
 type TodayViewProps = {
+  activeWordbookName: string;
   activeGroup: number;
   setActiveGroup: (index: number) => void;
   dayGroups: DayRange[];
@@ -20,14 +21,13 @@ type TodayViewProps = {
   dailyNewWords: number;
   completedReviewEntries: string[];
   onOpenDay: (entry: PlanEntry) => void;
-  onReview: () => void;
-  due: number;
   cards: WordCard[];
   packs: ContextPack[];
   accuracy: number;
 };
 
 export function TodayView({
+  activeWordbookName,
   activeGroup,
   setActiveGroup,
   dayGroups,
@@ -38,8 +38,6 @@ export function TodayView({
   nextDay,
   dailyNewWords,
   onOpenDay,
-  onReview,
-  due,
   cards,
   packs,
   accuracy,
@@ -69,10 +67,6 @@ export function TodayView({
               </span>
             </button>
           ))}
-          <div className="sidebar-rule" />
-          <button type="button" className="plan-settings" onClick={onReview}>
-            复习到期词 <strong>{due}</strong>
-          </button>
           <div className="sidebar-progress">
             <span>今日学习进度</span>
             <strong>{todayComplete ? "100" : "0"}%</strong>
@@ -92,6 +86,7 @@ export function TodayView({
           <div className="plan-board-head">
             <div>
               <p className="eyebrow">Study plan / 复习计划</p>
+              <p className="plan-wordbook-context">当前词书 · {activeWordbookName}</p>
               <h1>按计划重排，按语境记住。</h1>
               <p className="lede">
                 按学习日依次推进；完成上一排全部任务后，下一排自动解锁。
@@ -156,7 +151,7 @@ export function TodayView({
                                 }
                                 onClick={() => entry && onOpenDay(entry)}
                               >
-                                {isComplete && entry?.kind === "review" ? (
+                                {isComplete ? (
                                   <span aria-hidden="true">✓</span>
                                 ) : (
                                   value
