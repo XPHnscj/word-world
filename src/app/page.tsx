@@ -1710,6 +1710,11 @@ function Settings({
   libraryCount: number;
   vocabLoading: boolean;
 }) {
+  type ServerConfigInfo = {
+    serverConfigured: boolean;
+    serverBaseUrl: string;
+    serverModel: string | null;
+  };
   const [draft, setDraft] = useState(settings);
   const [section, setSection] = useState<"plan" | "model" | "effects" | "reset">("plan");
   const [confirmReset, setConfirmReset] = useState(false);
@@ -1727,7 +1732,16 @@ function Settings({
     void fetch("/api/context-packs/config")
       .then((response) => response.json())
       .then((data) => {
-        if (!cancelled) setServerConfig(data);
+        if (cancelled) return;
+        setServerConfig(data);
+        if (data.serverConfigured) {
+          setDraft((current) => ({
+            ...current,
+            baseUrl: data.serverBaseUrl || current.baseUrl,
+            model: data.serverModel || current.model,
+            protocol: "openai_compatible_chat",
+          }));
+        }
       })
       .catch(() => {
         /* 探测失败时静默，界面按未配置处理 */
@@ -1737,7 +1751,7 @@ function Settings({
     };
   }, []);
   const serverOnly = Boolean(serverConfig?.serverConfigured);
-  const save = () => {
+  const save = async () => {
     setSettings(draft);
     const { apiKey, ...safeSettings } = draft;
     window.localStorage.setItem(
@@ -1746,7 +1760,35 @@ function Settings({
     );
     if (apiKey) window.sessionStorage.setItem("ielts-context-api-key", apiKey);
     else window.sessionStorage.removeItem("ielts-context-api-key");
-    setTestStatus("设置已保存，计划表与后续生成将使用新配置。");
+    if (section !== "model") {
+      setTestStatus("设置已保存，计划表与后续生成将使用新配置。");
+      return;
+    }
+    try {
+      const response = await fetch("/api/context-packs/config", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          apiKey: apiKey.trim() || undefined,
+          baseUrl: draft.baseUrl,
+          model: draft.model,
+        }),
+      });
+      const result = (await response.json()) as ServerConfigInfo | { error?: string };
+      if (!response.ok || !("serverConfigured" in result)) {
+        throw new Error("error" in result ? result.error : "服务端配置同步失败");
+      }
+      setServerConfig(result);
+      setDraft((current) => ({
+        ...current,
+        baseUrl: result.serverBaseUrl,
+        model: result.serverModel ?? current.model,
+        protocol: "openai_compatible_chat",
+      }));
+      setTestStatus("前端设置已保存，并已同步到服务端；后续生成将使用这套配置。");
+    } catch (error) {
+      setTestStatus(error instanceof Error ? error.message : "服务端配置同步失败，请重试。");
+    }
   };
   const testConnection = async () => {
     setTesting(true);
@@ -1815,7 +1857,7 @@ function Settings({
           className="settings-page-form"
           onSubmit={(event) => {
             event.preventDefault();
-            save();
+            void save();
           }}
         >
           <header className="settings-page-header">
@@ -1848,14 +1890,13 @@ function Settings({
             <div className="server-config-banner" role="status">
               <strong>✓ 服务端已配置模型服务</strong>
               <span>
-                地址{" "}
+                当前生效地址{" "}
                 <code>
                   {serverConfig?.serverBaseUrl || "默认地址"}
                 </code>{" "}
                 · 模型{" "}
                 <code>{serverConfig?.serverModel ?? "默认"}</code>
-                。生成短文与图片 OCR 将优先使用服务端配置；下方 Base URL /
-                API Key 仅在服务端未配置时生效（避免服务器密钥被转发到任意地址）。
+                。前端设置保存后会同步写入服务端；生成短文、图片 OCR 与复习评估共用这套配置。
               </span>
             </div>
           )}
@@ -1945,7 +1986,7 @@ function Settings({
             <label className="provider-input-group">
               <span>
                 Base URL
-                {serverOnly && <span className="server-only-tag">服务端已配置，此项被忽略</span>}
+                {serverOnly && <span className="server-only-tag">保存后同步服务端</span>}
               </span>
               <input
                 id="provider-url"
@@ -1972,7 +2013,7 @@ function Settings({
               <span className="provider-label-row">
                 <span>
                   API Key
-                  {serverOnly && <span className="server-only-tag">服务端已配置，此项被忽略</span>}
+                  {serverOnly && <span className="server-only-tag">留空则沿用服务端 Key</span>}
                 </span>
                 <a href={docsUrl} target="_blank" rel="noreferrer">
                   获取 API Key ↗
@@ -1986,7 +2027,7 @@ function Settings({
                 onChange={(event) =>
                   setDraft({ ...draft, apiKey: event.target.value })
                 }
-                placeholder="仅在调用时提交"
+                placeholder={serverOnly ? "留空则沿用服务端 Key；填写可替换" : "填写后同步到本机服务端"}
               />
             </label>
             <label className="provider-input-group">
