@@ -182,8 +182,6 @@ export interface UserWordbook {
   name: string;
   words: string;
   createdAt: string;
-  /** 系统维护的主词库扩展/明日优先词，不显示为普通自定义词书。 */
-  kind?: "custom" | "priority";
 }
 
 /** 一次完整的首次学习或艾宾浩斯复习会话。 */

@@ -4,7 +4,6 @@ import type { StorageSnapshot } from "./storageTypes";
 
 /** packs 必须索引 planDay，重新生成时才能按学习日原子替换旧短文。 */
 export const PACKS_SCHEMA = "id, createdAt, planDay";
-export const PRIORITY_WORD_BOOK_ID = "priority-main-vocab";
 
 const PENDING_EVIDENCE_KEY = "ielts-context-pending-evidence";
 
@@ -241,54 +240,6 @@ export async function toggleWordKnown(lemma: string): Promise<boolean> {
   await learningDB.known.put({ lemma: clean, markedAt: isoNow() });
   scheduleServerSnapshotSync();
   return true;
-}
-
-/** 将日常遇到的生词并入主词库扩展，并标记为下一篇短文优先词。 */
-export async function addPriorityWord(lemma: string): Promise<boolean> {
-  const clean = lemma.trim().toLowerCase();
-  if (!/^[a-z][a-z'-]*$/.test(clean)) return false;
-  const added = await learningDB.transaction("rw", learningDB.wordbooks, async () => {
-    const existing = await learningDB.wordbooks.get(PRIORITY_WORD_BOOK_ID);
-    const words = existing?.words
-      .split(/\r?\n/)
-      .map((word) => word.trim().toLowerCase())
-      .filter(Boolean) ?? [];
-    if (words.includes(clean)) return false;
-    await learningDB.wordbooks.put({
-      id: PRIORITY_WORD_BOOK_ID,
-      name: "主词库扩展 · 明日优先",
-      words: [...words, clean].join("\n"),
-      createdAt: existing?.createdAt ?? isoNow(),
-      kind: "priority",
-    });
-    return true;
-  });
-  if (!added) return false;
-  scheduleServerSnapshotSync();
-  return true;
-}
-
-/** 生词完成一次可靠拼写后移出明日优先队列；如果仍然答错则继续保留。 */
-export async function removePriorityWord(lemma: string): Promise<void> {
-  const clean = lemma.trim().toLowerCase();
-  const removed = await learningDB.transaction("rw", learningDB.wordbooks, async () => {
-    const existing = await learningDB.wordbooks.get(PRIORITY_WORD_BOOK_ID);
-    if (!existing) return false;
-    const originalWords = existing.words
-      .split(/\r?\n/)
-      .map((word) => word.trim().toLowerCase())
-      .filter(Boolean);
-    const words = originalWords.filter((word) => word !== clean);
-    if (words.length === originalWords.length) return false;
-    if (words.length) {
-      await learningDB.wordbooks.put({ ...existing, words: words.join("\n") });
-    } else {
-      await learningDB.wordbooks.delete(PRIORITY_WORD_BOOK_ID);
-    }
-    return true;
-  });
-  if (!removed) return;
-  scheduleServerSnapshotSync();
 }
 
 export interface PackMeta {

@@ -937,30 +937,6 @@ input[type="text"]:focus {
   background: rgba(192, 57, 43, 0.08);
   border-radius: 3px;
 }
-/* 将当前词加入主词库扩展，并在下一篇短文中优先融入。 */
-.priority-word-action {
-  width: fit-content;
-  border: 1px solid rgba(23, 126, 113, 0.3);
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  padding: 3px 8px;
-  font-size: 11px;
-  line-height: 1.25;
-  cursor: pointer;
-  transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
-}
-.priority-word-action:hover,
-.priority-word-action:focus-visible {
-  border-color: var(--accent);
-  background: #cce8e1;
-  transform: translateY(-1px);
-}
-.inline-spell .priority-word-action {
-  display: inline-block;
-  margin-left: 6px;
-  vertical-align: middle;
-}
 /* 填词模式：标记为“已经会了”的词——橙色划线显示，点击可恢复（双向切换） */
 .vocab-skipped {
   display: inline-block;

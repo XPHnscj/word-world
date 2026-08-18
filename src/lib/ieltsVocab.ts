@@ -90,30 +90,6 @@ export function pickDiverseVocabulary(
   return picked;
 }
 
-/**
- * 先消费用户标记的明日优先词，再用内置词库补齐每日名额。
- * 优先词也会从补齐候选中排除，确保超过每日上限时能顺延到后续学习日。
- */
-export function pickPriorityThenDiverseVocabulary(
-  priorityWords: readonly string[],
-  entries: IeltsEntry[],
-  excluded: ReadonlySet<string>,
-  count: number,
-  random: () => number = Math.random,
-): string[] {
-  const normalizedPriority = [...new Set(priorityWords.map((word) => word.trim().toLowerCase()))]
-    .filter((word) => word && !excluded.has(word));
-  const selectedPriority = normalizedPriority.slice(0, Math.max(0, count));
-  const freshExcluded = new Set([...excluded, ...normalizedPriority]);
-  const fresh = pickDiverseVocabulary(
-    entries,
-    freshExcluded,
-    Math.max(0, count - selectedPriority.length),
-    random,
-  );
-  return [...selectedPriority, ...fresh].slice(0, Math.max(0, count));
-}
-
 const STORAGE_KEY = "ielts-context-vocab-v1";
 let sharedPromise: Promise<IeltsEntry[]> | null = null;
 
