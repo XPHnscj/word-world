@@ -39,13 +39,15 @@ export async function POST(request: Request): Promise<NextResponse<ServerConfigI
     const apiKey = typeof body.apiKey === "string" && body.apiKey.trim()
       ? body.apiKey.trim()
       : current.apiKey;
-    const baseUrl = normalizeClientProviderUrl(body.baseUrl, false);
+    // 开发环境允许本机 HTTP 代理；生产环境由 normalizeClientProviderUrl
+    // 的默认策略继续只接受公开 HTTPS 地址。
+    const baseUrl = normalizeClientProviderUrl(body.baseUrl);
     const model = typeof body.model === "string" ? body.model.trim() : "";
     if (!apiKey) {
       return NextResponse.json({ error: "请先填写 API Key。" }, { status: 400 });
     }
     if (!baseUrl) {
-      return NextResponse.json({ error: "Base URL 必须是公开 HTTPS 接口地址。" }, { status: 400 });
+      return NextResponse.json({ error: "Base URL 无效：本地开发可使用 HTTP 代理，线上请使用公开 HTTPS 地址。" }, { status: 400 });
     }
     if (!model) {
       return NextResponse.json({ error: "请填写模型名称。" }, { status: 400 });

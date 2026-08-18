@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Image from "next/image";
 import { useLiveQuery } from "dexie-react-hooks";
 import {
@@ -21,16 +21,21 @@ import {
   toggleWordKnown,
   writeServerSnapshot,
 } from "@/lib/db";
-import type { CapabilityDimension, ContextPack, HintLevel, LearningEvidence, ReviewEvaluation, ReviewPhase, ReviewRating, ReviewTask, UserWordbook, WordCard } from "@/lib/types";
-import { adaptiveSchedule, applyDimensionEvidence, buildAdaptiveQueue, capabilitiesOf, CAPABILITY_DIMENSIONS, emptyDimensionState, getMasteryLevel, nextLevel, phaseForLevel, phaseLabel, routeNextTask } from "@/lib/reviewEngine";
-import { makeReviewDemoBundle } from "@/lib/reviewDemo";
+import type { CapabilityDimension, ContextPack, HintLevel, LearningEvidence, UserWordbook, WordbookPlan, WordCard } from "@/lib/types";
+import { applyDimensionEvidence, capabilitiesOf, CAPABILITY_DIMENSIONS, emptyDimensionState } from "@/lib/reviewEngine";
 import {
-  loadBuiltinVocab,
   pickDiverseVocabulary,
   type IeltsEntry,
 } from "@/lib/ieltsVocab";
+import { BUILTIN_WORDBOOKS, getBuiltinWordbook, isBuiltinWordbookId } from "@/lib/builtinWordbooks";
+import { loadWordbookVocab } from "@/lib/wordbookVocab";
+import {
+  EXTERNAL_VOCABULARY_ID,
+  EXTERNAL_VOCABULARY_NAME,
+  parseExternalWords,
+} from "@/lib/externalVocabulary";
 import { countEnglishWords, findDuplicateTarget, findMissingTargets, findMissingTranslationAnnotations, hasCompleteTranslationAnnotations, normalizeTranslationChunk, parseContextPack } from "@/lib/contextPack";
-import { TASK_SPECS, hintForLevel } from "@/lib/reviewTasks";
+import { buildLocalPassage } from "@/lib/localPassage";
 import { TodayView } from "./components/TodayView";
 import { ProgressView } from "./components/ProgressView";
 import { StatisticsView } from "./components/StatisticsView";
@@ -39,13 +44,11 @@ import {
   buildReviewColumns,
   DEFAULT_AI_SETTINGS,
   DEFINITIONS,
-  DIMENSION_BY_TASK,
   PROVIDER_PRESETS,
   TABS,
   type AISettings,
   type AppTab,
   type PlanEntry,
-  type PlanningMode,
   planEntryKey,
 } from "./learning-config";
 /** 全局轻提示：生成完成等后台结果的通知。 */
@@ -220,7 +223,6 @@ function playSpellingOutcome(kind: "wrong" | "success", sound: AISettings["typin
 
 export default function Page() {
   const [tab, setTab] = useState<AppTab>("today");
-  const [raw, setRaw] = useState("");
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [pack, setPack] = useState<ContextPack | null>(null);
   const [selectedDay, setSelectedDay] = useState(1);
@@ -237,27 +239,9 @@ export default function Page() {
   const [spellingScore, setSpellingScore] = useState<number | null>(null);
   const [spellingResults, setSpellingResults] = useState<Record<string, SpellingResult>>({});
   const [hoveredWord, setHoveredWord] = useState<string | null>(null);
-  const [reviewCard, setReviewCard] = useState<WordCard | null>(null);
-  const [reviewTask, setReviewTask] = useState<ReviewTask>("meaning");
-  const [reviewPhase, setReviewPhase] = useState<ReviewPhase>("recognition");
-  /** 可解释路由器给出的“本次练习原因”（复习页一行小字）。 */
-  const [reviewReason, setReviewReason] = useState<string | null>(null);
-  /** 路由器选定的能力维度（决定任务库的提示阶梯与离线判定）。 */
-  const [reviewDimension, setReviewDimension] = useState<CapabilityDimension>("meaningRecall");
-  /** 动态提示阶梯层级 0-5（0=无提示）。 */
-  const [reviewHintLevel, setReviewHintLevel] = useState<HintLevel>(0);
-  const [reviewQueueCards, setReviewQueueCards] = useState<WordCard[]>([]);
-  const [reviewInput, setReviewInput] = useState("");
   const [feedback, setFeedback] = useState<string | null>(null);
-  const [reviewRevealed, setReviewRevealed] = useState(false);
-  const [pendingReviewRating, setPendingReviewRating] = useState<ReviewRating | null>(null);
-  const [reviewEvaluation, setReviewEvaluation] = useState<ReviewEvaluation | null>(null);
-  const [reviewEvaluating, setReviewEvaluating] = useState(false);
-  const [reviewSessionDone, setReviewSessionDone] = useState(0);
-  const [reviewComplete, setReviewComplete] = useState(false);
-  const [reviewStartedAt, setReviewStartedAt] = useState(() => Date.now());
   const [aiSettings, setAiSettings] = useState<AISettings>(DEFAULT_AI_SETTINGS);
-  /** 内置 IELTS 词库（nglsh-master/IELTS-4000.txt，经 /api/ielts-vocab 加载）。 */
+  /** 当前内置词书的词条；切换词书时按需加载，不一次性读取全部词库。 */
   const [vocab, setVocab] = useState<IeltsEntry[]>([]);
   const [vocabLoading, setVocabLoading] = useState(true);
   /** 是否正在后台生成短文（防止重复点击触发多次生成）。 */
@@ -269,74 +253,162 @@ export default function Page() {
   /** 流式生成进度节流：避免每收到几个字就重渲染一次。 */
   const progressRef = useRef(0);
   const [storageReady, setStorageReady] = useState(false);
+  const [activeWordbookId, setActiveWordbookId] = useState("builtin-ielts");
+  const activeBuiltinWordbook = getBuiltinWordbook(activeWordbookId);
 
   const liveCards = useLiveQuery(() => learningDB.cards.toArray(), []);
   const livePacks = useLiveQuery(() => learningDB.packs.toArray(), []);
   const liveAttempts = useLiveQuery(() => learningDB.attempts.toArray(), []);
   const liveKnown = useLiveQuery(() => learningDB.known.toArray(), []);
+  const liveWordbooks = useLiveQuery(() => learningDB.wordbooks.toArray(), []);
+  const activeWordbookName = useMemo(
+    () => activeBuiltinWordbook?.name ?? liveWordbooks?.find((book) => book.id === activeWordbookId)?.name ?? "自定义词书",
+    [activeBuiltinWordbook, activeWordbookId, liveWordbooks],
+  );
   const cards = useMemo(() => liveCards ?? [], [liveCards]);
   const packs = useMemo(() => livePacks ?? [], [livePacks]);
   const attempts = useMemo(() => liveAttempts ?? [], [liveAttempts]);
+  const activePacks = useMemo(
+    () => packs.filter((item) => (item.wordbookId ?? "builtin-ielts") === activeWordbookId),
+    [activeWordbookId, packs],
+  );
+  const externalWords = useMemo(() => {
+    const book = (liveWordbooks ?? []).find((item) => item.id === EXTERNAL_VOCABULARY_ID);
+    return book ? parseExternalWords(book.words) : [];
+  }, [liveWordbooks]);
   /** 用户标记为“已经会了”的词元：填词时显示橙色跳过，且不再出现在新短文里。 */
   const knownSet = useMemo(
     () => new Set((liveKnown ?? []).map((entry) => entry.lemma)),
     [liveKnown],
   );
-  /** 内置词库查找表：lemma -> 英文释义。 */
+  /** 内置词库与外部积累词库查找表：lemma -> 英文释义。外部词暂无中文也可以先学习。 */
+  const mergedVocab = useMemo(() => {
+    const entries = [...vocab];
+    const existing = new Set(entries.map((entry) => entry.lemma.toLowerCase()));
+    for (const lemma of externalWords) {
+      if (!existing.has(lemma)) entries.push({ lemma, definition: "" });
+    }
+    return entries;
+  }, [vocab, externalWords]);
   const vocabMap = useMemo(
-    () => new Map(vocab.map((entry) => [entry.lemma, entry.definition])),
-    [vocab],
+    () => new Map(mergedVocab.map((entry) => [entry.lemma, entry.definition])),
+    [mergedVocab],
   );
   /** 已学（出现在词卡或已生成短文里）的词元，用于从词库顺序取下一组。 */
   const studiedLemmas = useMemo(() => {
     const studied = new Set<string>();
     for (const card of cards) studied.add(card.lemma.toLowerCase());
-    for (const pack of packs)
+    for (const pack of activePacks)
       for (const use of pack.targetWords) studied.add(use.lemma.toLowerCase());
     return studied;
-  }, [cards, packs]);
-  /** 内置词库中下一组未学过的词：随机抽取并分散首字母。 */
+  }, [activePacks, cards]);
+  /** 外部积累词优先，其余从内置词库随机抽取并分散首字母。 */
   const nextLibraryWords = useMemo(() => {
     const excluded = new Set([...studiedLemmas, ...knownSet]);
-    return pickDiverseVocabulary(vocab, excluded, aiSettings.dailyNewWords);
-  }, [vocab, studiedLemmas, knownSet, aiSettings.dailyNewWords]);
+    const priority = externalWords.filter((word) => !excluded.has(word));
+    const remainingCount = Math.max(0, aiSettings.dailyNewWords - priority.length);
+    const fallbackExcluded = new Set([...excluded, ...priority]);
+    const fallback = pickDiverseVocabulary(mergedVocab, fallbackExcluded, remainingCount);
+    return [...priority.slice(0, aiSettings.dailyNewWords), ...fallback].slice(
+      0,
+      aiSettings.dailyNewWords,
+    );
+  }, [mergedVocab, externalWords, studiedLemmas, knownSet, aiSettings.dailyNewWords]);
   const totalDays = Math.max(1, aiSettings.targetDays);
   const dayGroups = useMemo(() => buildDayGroups(totalDays), [totalDays]);
   const reviewColumns = useMemo(
     () => buildReviewColumns(totalDays),
     [totalDays],
   );
-  const nowTimestamp = Date.now();
-  const dueCards = useMemo(
-    () => buildAdaptiveQueue(cards, attempts, nowTimestamp, 30),
-    [cards, attempts, nowTimestamp],
-  );
   const nextDay =
     Array.from({ length: totalDays }, (_, index) => index + 1).find(
       (day) => !completedDays.includes(day),
     ) ?? totalDays;
-  const reviewContext = useMemo(() => {
-    if (!reviewCard) return undefined;
-    const pack =
-      packs.find((p) => reviewCard.packIds.includes(p.id)) ?? packs.at(-1);
-    if (!pack) return undefined;
-    const use = pack.targetWords.find(
-      (word) => word.lemma === reviewCard.lemma,
-    );
-    const sentences = pack.passage.split(/(?<=[.!?])\s+/).filter(Boolean);
-    return (
-      sentences.find((sentence) =>
-        sentence.toLowerCase().includes(reviewCard.lemma.toLowerCase()),
-      ) ??
-      (use ? sentences[use.sentenceIndex] : undefined) ??
-      sentences[0]
-    );
-  }, [reviewCard, packs]);
   const accuracy = attempts.length
     ? Math.round(
         (attempts.filter((a) => a.correct).length / attempts.length) * 100,
       )
     : 0;
+
+  const wordbookPlanFor = useCallback((book: UserWordbook | undefined, vocabularyCount: number, settings = aiSettings): WordbookPlan => {
+    const fallbackTotal = Math.max(1, vocabularyCount || settings.totalVocabulary);
+    const dailyNewWords = Math.max(1, book?.plan?.dailyNewWords ?? settings.dailyNewWords);
+    const totalVocabulary = Math.max(1, book?.plan?.totalVocabulary ?? fallbackTotal);
+    return {
+      totalVocabulary,
+      dailyNewWords,
+      targetDays: Math.max(1, book?.plan?.targetDays ?? Math.ceil(totalVocabulary / dailyNewWords)),
+      completedDays: [...new Set(book?.plan?.completedDays ?? [])].sort((a, b) => a - b),
+      completedReviewEntries: [...new Set(book?.plan?.completedReviewEntries ?? [])],
+      updatedAt: book?.plan?.updatedAt ?? isoNow(),
+    };
+  }, [aiSettings]);
+
+  const persistWordbookPlan = useCallback(async (
+    plan: Partial<WordbookPlan>,
+    settings = aiSettings,
+  ) => {
+    const current = await learningDB.wordbooks.get(activeWordbookId);
+    const base = wordbookPlanFor(current, isBuiltinWordbookId(activeWordbookId) ? mergedVocab.length : parseExternalWords(current?.words ?? "").length, settings);
+    const nextPlan: WordbookPlan = { ...base, ...plan, updatedAt: isoNow() };
+    const book: UserWordbook = current ?? {
+      id: activeWordbookId,
+      name: activeBuiltinWordbook?.name ?? "自定义词书",
+      words: "",
+      createdAt: isoNow(),
+    };
+    await learningDB.wordbooks.put({ ...book, plan: nextPlan });
+    scheduleServerSnapshotSync();
+  }, [activeWordbookId, activeBuiltinWordbook, aiSettings, mergedVocab.length, wordbookPlanFor]);
+
+  const selectWordbook = useCallback(async (id: string, vocabularyCount: number) => {
+    const current = await learningDB.wordbooks.get(id);
+    const plan = wordbookPlanFor(current, vocabularyCount);
+    const book: UserWordbook = current ?? {
+      id,
+      name: getBuiltinWordbook(id)?.name ?? "自定义词书",
+      words: "",
+      createdAt: isoNow(),
+    };
+    await learningDB.wordbooks.put({ ...book, plan });
+    setActiveWordbookId(id);
+    window.localStorage.setItem("ielts-context-active-wordbook", id);
+    // 切换词书后，旧词书的阅读文章和当前任务不能继续留在界面上。
+    // 否则计划已经切换，阅读页仍会显示旧的“IELTS 词库 · 第 N 天”。
+    setPack(null);
+    setActivePlanEntry(null);
+    setSpellingAnswers({});
+    setSpellingPassed(false);
+    setSpellingScore(null);
+    setSpellingResults({});
+    setFeedback(null);
+    setAiSettings((previous) => ({
+      ...previous,
+      totalVocabulary: plan.totalVocabulary,
+      dailyNewWords: plan.dailyNewWords,
+      targetDays: plan.targetDays,
+    }));
+    setCompletedDays(plan.completedDays);
+    setCompletedReviewEntries(plan.completedReviewEntries);
+    const nextDay = Array.from({ length: plan.targetDays }, (_, index) => index + 1)
+      .find((day) => !plan.completedDays.includes(day)) ?? plan.targetDays;
+    setSelectedDay(nextDay);
+    window.localStorage.setItem("ielts-context-completed-days", JSON.stringify(plan.completedDays));
+    window.localStorage.setItem("ielts-context-completed-reviews", JSON.stringify(plan.completedReviewEntries));
+  }, [wordbookPlanFor]);
+
+  const wordbookInitRef = useRef(false);
+  useEffect(() => {
+    if (!storageReady || wordbookInitRef.current || liveWordbooks === undefined) return;
+    wordbookInitRef.current = true;
+    const storedId = window.localStorage.getItem("ielts-context-active-wordbook");
+    const storedBook = storedId && liveWordbooks.some((book) => book.id === storedId) ? storedId : null;
+    const initialId = storedBook ?? (storedId && isBuiltinWordbookId(storedId) ? storedId : "builtin-ielts");
+    const builtin = getBuiltinWordbook(initialId);
+    const custom = liveWordbooks.find((book) => book.id === initialId);
+    const vocabularyCount = builtin?.wordCount ?? (custom ? parseExternalWords(custom.words).length : mergedVocab.length || 4000);
+    void selectWordbook(initialId, vocabularyCount);
+  }, [liveWordbooks, mergedVocab.length, selectWordbook, storageReady]);
 
   useEffect(() => {
     let cancelled = false;
@@ -373,10 +445,38 @@ export default function Page() {
         ),
       )
       .then(() => scheduleServerSnapshotSync());
+  }, [activeWordbookId]);
+  useEffect(() => {
+    // 移除旧版本“随机复习体验”写入的演示数据，避免它覆盖计划日的正式语境短文。
+    void learningDB
+      .transaction("rw", [learningDB.cards, learningDB.packs], async () => {
+        const legacyPacks = await learningDB.packs
+          .where("id")
+          .startsWith("review_demo_pack_")
+          .primaryKeys();
+        const legacyCards = await learningDB.cards
+          .where("id")
+          .startsWith("review_demo_")
+          .primaryKeys();
+        if (legacyPacks.length) await learningDB.packs.bulkDelete(legacyPacks);
+        if (legacyCards.length) await learningDB.cards.bulkDelete(legacyCards);
+        return legacyPacks.length > 0 || legacyCards.length > 0;
+      })
+      .then((removed) => {
+        if (removed) scheduleServerSnapshotSync();
+      });
   }, []);
   useEffect(() => {
     let cancelled = false;
-    void loadBuiltinVocab()
+    if (!isBuiltinWordbookId(activeWordbookId)) {
+      setVocab([]);
+      setVocabLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+    setVocabLoading(true);
+    void loadWordbookVocab(activeWordbookId)
       .then((entries) => {
         if (cancelled) return;
         setVocab(entries);
@@ -388,7 +488,7 @@ export default function Page() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [activeWordbookId]);
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 8000);
@@ -399,6 +499,7 @@ export default function Page() {
     if (url.searchParams.get("reset-study") !== "1") return;
     url.searchParams.delete("reset-study");
     void resetStudyProgress()
+      .then(() => persistWordbookPlan({ completedDays: [], completedReviewEntries: [] }))
       .then(() => {
         window.localStorage.removeItem("ielts-context-completed-days");
         window.localStorage.removeItem("ielts-context-completed-reviews");
@@ -410,7 +511,7 @@ export default function Page() {
       })
       .catch(() => setToast({ message: "本地学习数据重置失败，请刷新后重试。" }))
       .finally(() => window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`));
-  }, []);
+  }, [persistWordbookPlan]);
   useEffect(() => {
     void ensurePersistentStorage();
     void flushPendingEvidence();
@@ -455,7 +556,13 @@ export default function Page() {
     const dayPack =
       [...packs]
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-        .find((pack) => pack.planDay === day) ?? null;
+        .find(
+          (pack) =>
+            pack.planDay === day &&
+            (pack.wordbookId ?? "builtin-ielts") === activeWordbookId &&
+            !pack.id.startsWith("review_demo_pack_") &&
+            pack.title !== "随机复习体验",
+        ) ?? null;
     setPack(dayPack);
     startReading(day, entry.kind === "review" ? "spell" : "show");
     setActivePlanEntry(entry);
@@ -530,15 +637,15 @@ export default function Page() {
           keySentence,
           generatedBy,
           planDay: targetDay,
+          wordbookId: activeWordbookId,
           title:
             source === "library"
-              ? `IELTS 词库 · 第 ${targetDay} 天`
+              ? `${activeWordbookName} · 第 ${targetDay} 天`
               : undefined,
-          topic: passageMeta ? `${passageMeta.contentType} · ${passageMeta.sceneTopic}` : source === "library" ? "内置 IELTS 词库" : undefined,
+          topic: passageMeta ? `${passageMeta.contentType} · ${passageMeta.sceneTopic}` : source === "library" ? `${activeWordbookName}词书` : undefined,
         },
       );
-      await learningDB.packs.put(nextPackValue);
-      scheduleServerSnapshotSync();
+      await replacePackForDay(targetDay, nextPackValue, activeWordbookId);
       setPack(nextPackValue);
       setUploadStatus(modeNote);
       setToast({
@@ -580,7 +687,7 @@ export default function Page() {
     generatedBy: "ai" | "local";
     modeNote: string;
   }> => {
-    let passage = buildPassage(words, aiSettings.planning);
+    let passage = buildLocalPassage(words, aiSettings.planning);
     let translation: string | undefined;
     let meanings:
       | Record<
@@ -773,8 +880,15 @@ export default function Page() {
         });
       }
     };
-    const { passage, translation, meanings, keySentence, passageMeta, generatedBy, modeNote } =
-      await fetchGeneratedPack(words, adjustment, onProgress);
+    let generated: Awaited<ReturnType<typeof fetchGeneratedPack>>;
+    try {
+      generated = await fetchGeneratedPack(words, adjustment, onProgress);
+    } catch {
+      setToast({ message: `第 ${targetDay} 天短文重新生成超时或中断，已恢复按钮，可以稍后重试。` });
+      setGenerating(false);
+      return;
+    }
+    const { passage, translation, meanings, keySentence, passageMeta, generatedBy, modeNote } = generated;
     try {
       // 替换该天旧短文，避免同一学习日出现多份版本。
       const nextPackValue = makePack(
@@ -788,11 +902,12 @@ export default function Page() {
           keySentence,
           generatedBy,
           planDay: targetDay,
-          title: pack.title,
+          wordbookId: activeWordbookId,
+          title: `${activeWordbookName} · 第 ${targetDay} 天`,
           topic: passageMeta ? `${passageMeta.contentType} · ${passageMeta.sceneTopic}` : pack.topic,
         },
       );
-      await replacePackForDay(targetDay, nextPackValue);
+      await replacePackForDay(targetDay, nextPackValue, activeWordbookId);
       setPack(nextPackValue);
       setAdjustmentText("");
       setSpellingAnswers({});
@@ -809,47 +924,26 @@ export default function Page() {
     }
   };
 
-  const importWords = async () => {
-    const words = [
-      ...new Set(
-        (raw.match(/[A-Za-z][A-Za-z'-]*/g) ?? []).map((word) =>
-          word.toLowerCase(),
-        ),
-      ),
-    ];
-    if (!words.length) return;
-    await generatePackFor(words, "paste");
-  };
-
-  /** 从内置 IELTS 词库取下一组未学过的词，直接生成当天短文。 */
+  /** 从当前内置词书取下一组未学过的词，直接生成当天短文。 */
   const generateLibraryPack = async () => {
     if (!nextLibraryWords.length) {
       setUploadStatus(
         vocabLoading
-          ? "内置 IELTS 词库加载中，请稍候…"
-          : "内置词库中没有未学过的词了；可在设置中调整每日新词，或导入自己的词表。",
+          ? `${activeWordbookName}词库加载中，请稍候…`
+          : "可用词库中没有未学过的词了；可在设置中调整每日新词，或加入外部词汇。",
       );
       return;
     }
     await generatePackFor(nextLibraryWords, "library");
   };
 
-  const updatePlanVocabulary = (totalVocabulary: number) => {
-    const nextSettings = {
-      ...aiSettings,
-      totalVocabulary: Math.max(1, totalVocabulary),
-      targetDays: Math.max(
-        1,
-        Math.ceil(totalVocabulary / Math.max(1, aiSettings.dailyNewWords)),
-      ),
-    };
+  const applySettings = (nextSettings: AISettings) => {
     setAiSettings(nextSettings);
-    const { apiKey: _apiKey, ...safeSettings } = nextSettings;
-    void _apiKey;
-    window.localStorage.setItem(
-      "ielts-context-ai-settings",
-      JSON.stringify(safeSettings),
-    );
+    void persistWordbookPlan({
+      totalVocabulary: nextSettings.totalVocabulary,
+      dailyNewWords: nextSettings.dailyNewWords,
+      targetDays: nextSettings.targetDays,
+    }, nextSettings);
   };
 
   /** 构建一条学习证据（任务结果 → 不可变记录，增量写入 SQLite）。 */
@@ -1026,6 +1120,7 @@ export default function Page() {
         ...new Set([...completedReviewEntries, planEntryKey(activePlanEntry)]),
       ];
       setCompletedReviewEntries(updatedReviews);
+      await persistWordbookPlan({ completedReviewEntries: updatedReviews });
       window.localStorage.setItem(
         "ielts-context-completed-reviews",
         JSON.stringify(updatedReviews),
@@ -1035,6 +1130,7 @@ export default function Page() {
         (a, b) => a - b,
       );
       setCompletedDays(updated);
+      await persistWordbookPlan({ completedDays: updated });
       window.localStorage.setItem(
         "ielts-context-completed-days",
         JSON.stringify(updated),
@@ -1101,185 +1197,6 @@ export default function Page() {
     );
   };
 
-  const beginReview = (queueOverride?: WordCard[]) => {
-    const queue = queueOverride ?? dueCards;
-    const card = queue[0] ?? null;
-    setReviewQueueCards(queue);
-    setReviewCard(card ?? null);
-    if (card) {
-      const phase = phaseForLevel(getMasteryLevel(card));
-      setReviewPhase(phase);
-      const route = routeNextTask(card, attempts.filter((attempt) => attempt.cardId === card.id));
-      setReviewTask(route.task);
-      setReviewReason(route.reason);
-      setReviewDimension(route.dimension);
-      setReviewHintLevel(0);
-    }
-    setReviewInput("");
-    setFeedback(null);
-    setReviewRevealed(false);
-    setPendingReviewRating(null);
-    setReviewEvaluation(null);
-    setReviewEvaluating(false);
-    setReviewSessionDone(0);
-    setReviewComplete(false);
-    setReviewStartedAt(Date.now());
-    setTab("review");
-  };
-  const seedReviewDemo = async () => {
-    const { cards: demoCards, pack: demoPack } = makeReviewDemoBundle();
-    await learningDB.transaction("rw", [learningDB.cards, learningDB.packs], async () => {
-      await learningDB.packs.where("id").startsWith("review_demo_pack_").delete();
-      await learningDB.cards.bulkPut(demoCards);
-      await learningDB.packs.put(demoPack);
-    });
-    scheduleServerSnapshotSync();
-    setFeedback("随机体验词卡已载入，共 4 张，包含 Lv1–Lv4。正在打开复习队列。");
-    beginReview(buildAdaptiveQueue(demoCards, attempts, Date.now(), 30));
-  };
-  const evaluateReviewAnswer = async () => {
-    if (!reviewCard || !reviewInput.trim()) return;
-    setReviewEvaluating(true);
-    const spec = TASK_SPECS[reviewDimension];
-    const local = spec.judge(reviewCard, reviewInput);
-    setReviewEvaluation({
-      passed: local.correct,
-      score: local.score,
-      feedback: local.correct ? "本地检查通过，可以继续评价这次记忆状态。" : "还没有达到当前任务的最低要求，可以查看提示后再试。",
-      source: "local",
-    });
-    // 只有主动造句和跨语境迁移需要 AI 做自然度补充判断，其余任务保持离线可用。
-    if ((reviewDimension === "production" || reviewDimension === "transfer") && aiSettings.apiKey) {
-      try {
-        const response = await fetch("/api/reviews/evaluate", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            lemma: reviewCard.lemma,
-            answer: reviewInput,
-            phase: reviewPhase,
-            meaningZh: reviewCard.meaningZh,
-            sceneTopic: reviewDimension === "transfer" ? migrationTopic(reviewCard, reviewCard.correct) : "日常具体情境",
-            ...aiSettings,
-          }),
-        });
-        const payload = (await response.json()) as { evaluation?: ReviewEvaluation };
-        if (payload.evaluation) setReviewEvaluation(payload.evaluation);
-      } catch {
-        // 本地初筛结果已经可以继续复习。
-      }
-    }
-    setReviewEvaluating(false);
-    setReviewRevealed(true);
-  };
-  const chooseReviewRating = (rating: ReviewRating) => {
-    if (!reviewCard) return;
-    if (rating === "known" && !reviewEvaluation?.passed) {
-      setFeedback("先完成一句包含目标词的自然表达；模型通过后才能升级。你也可以选择“模糊”或“忘记”。");
-      return;
-    }
-    setPendingReviewRating(rating);
-    setReviewRevealed(true);
-  };
-  const commitReviewRating = async () => {
-    if (!reviewCard || !pendingReviewRating) return;
-    const rating = pendingReviewRating;
-    const reviewedAt = isoNow();
-    const evaluationPassed = Boolean(reviewEvaluation?.passed);
-    const level = getMasteryLevel(reviewCard);
-    const promotedLevel = nextLevel(level, rating, reviewPhase, evaluationPassed);
-    const nextSchedule = adaptiveSchedule(reviewCard.schedule, level, rating, reviewedAt);
-    const correct = rating === "known";
-    const nextStage = promotedLevel >= 4 ? "stable" : promotedLevel === 3 ? "recalled" : promotedLevel === 2 ? "understood" : "encountered";
-    const updated = {
-      ...reviewCard,
-      schedule: nextSchedule,
-      correct: reviewCard.correct + (correct ? 1 : 0),
-      lapses: reviewCard.lapses + (correct ? 0 : 1),
-      hints: reviewCard.hints + (rating === "fuzzy" ? 1 : 0),
-      stage: nextStage,
-      masteryLevel: promotedLevel,
-      updatedAt: reviewedAt,
-    } as WordCard;
-    if (reviewPhase === "transfer") {
-      const topic = migrationTopic(reviewCard, reviewCard.correct);
-      updated.transferTopics = [...new Set([...(reviewCard.transferTopics ?? []), topic])].slice(-6);
-    }
-    const dimension = DIMENSION_BY_TASK[reviewTask];
-    updated.dimensions = {
-      ...updated.dimensions,
-      [dimension]: Math.min(100, updated.dimensions[dimension] + (rating === "known" ? 18 : rating === "fuzzy" ? 6 : 0)),
-    };
-    // 复习证据：增量写入 SQLite，并按路由器维度更新多维能力状态。
-    const reviewEvidence: LearningEvidence = {
-      id: `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
-      cardId: updated.id,
-      dimension: reviewDimension,
-      taskType: reviewTask,
-      correct,
-      score: rating === "known" ? 100 : rating === "fuzzy" ? 50 : 0,
-      confidence: rating === "known" ? 4 : rating === "fuzzy" ? 2 : 1,
-      hintLevel: reviewHintLevel,
-      elapsedMs: Math.max(0, Date.now() - reviewStartedAt),
-      contextId: pack?.id,
-      contextTopic: reviewPhase === "transfer" ? migrationTopic(reviewCard, reviewCard.correct) : "复习会话",
-      evaluator: reviewEvaluation?.source ?? "local",
-      createdAt: reviewedAt,
-    };
-    void appendEvidenceServer([reviewEvidence]);
-    const currentCaps = capabilitiesOf(updated);
-    updated.capabilities = {
-      ...currentCaps,
-      [reviewDimension]: applyDimensionEvidence(
-        currentCaps[reviewDimension],
-        reviewEvidence,
-        new Date(reviewedAt).getTime(),
-      ),
-    };
-    await learningDB.cards.put(updated);
-    await learningDB.attempts.add({
-      id: `attempt_${Date.now()}`,
-      cardId: updated.id,
-      task: reviewTask,
-      correct,
-      hintLevel: reviewHintLevel,
-      confidence: rating === "known" ? 4 : rating === "fuzzy" ? 2 : 1,
-      elapsedMs: Math.max(0, Date.now() - reviewStartedAt),
-      reviewedAt,
-      rating,
-      phase: reviewPhase,
-      dimension: reviewDimension,
-      answer: reviewInput.trim() || undefined,
-      evaluation: reviewEvaluation ?? undefined,
-    });
-    scheduleServerSnapshotSync();
-    const remaining = rating === "forgot"
-      ? [...reviewQueueCards.slice(1), updated]
-      : reviewQueueCards.slice(1);
-    const nextCard = remaining[0] ?? null;
-    setReviewQueueCards(remaining);
-    setReviewSessionDone((value) => value + 1);
-    setReviewInput("");
-    setReviewRevealed(false);
-    setPendingReviewRating(null);
-    setReviewEvaluation(null);
-    setFeedback(null);
-    if (nextCard) {
-      setReviewCard(nextCard);
-      const nextPhase = phaseForLevel(getMasteryLevel(nextCard));
-      setReviewPhase(nextPhase);
-      const nextRoute = routeNextTask(nextCard, attempts.filter((attempt) => attempt.cardId === nextCard.id));
-      setReviewTask(nextRoute.task);
-      setReviewReason(nextRoute.reason);
-      setReviewDimension(nextRoute.dimension);
-      setReviewHintLevel(0);
-      setReviewStartedAt(Date.now());
-    } else {
-      setReviewCard(null);
-      setReviewComplete(true);
-    }
-  };
-
   const exportLearningData = async () => {
     const [exportCards, exportPacks, exportAttempts, exportKnown, exportWordbooks, exportSessions] = await Promise.all([
       learningDB.cards.toArray(),
@@ -1330,7 +1247,6 @@ export default function Page() {
     setCompletedReviewEntries([]);
     setActivePlanEntry(null);
     setActiveGroup(0);
-    setRaw("");
     setUploadStatus(null);
     setSpellingAnswers({});
     setSpellingResults({});
@@ -1358,11 +1274,19 @@ export default function Page() {
       <div className={`app-frame ${tab === "read" ? "reading-active" : ""}`}>
         {tab !== "read" && <header className="topbar">
           <div className="brand">
-            <strong>雅思语境记忆</strong>
+            <Image
+              className="brand-logo"
+              src="/brand/context-memory-logo.png"
+              alt=""
+              width={30}
+              height={30}
+              priority
+            />
+            <strong>语境记忆</strong>
             <span>Context Memory</span>
           </div>
           <div className="topbar-actions">
-            <span className="topbar-note">计划可随时调整，复习按表现安排</span>
+            <span className="topbar-note">按计划逐日学习，短文与词卡保存在本机</span>
           </div>
         </header>}
         {tab !== "read" && <nav className="nav" aria-label="主导航">
@@ -1371,7 +1295,7 @@ export default function Page() {
               key={id}
               className={tab === id ? "active" : ""}
               aria-current={tab === id ? "page" : undefined}
-              onClick={() => (id === "review" ? beginReview() : setTab(id))}
+              onClick={() => setTab(id)}
             >
               {label}
             </button>
@@ -1379,6 +1303,7 @@ export default function Page() {
         </nav>}
         {tab === "today" && (
           <TodayView
+            activeWordbookName={activeWordbookName}
             activeGroup={activeGroup}
             setActiveGroup={setActiveGroup}
             dayGroups={dayGroups}
@@ -1389,27 +1314,23 @@ export default function Page() {
             nextDay={nextDay}
             dailyNewWords={aiSettings.dailyNewWords}
             onOpenDay={openDay}
-            onReview={beginReview}
-            due={dueCards.length}
             cards={cards}
-            packs={packs}
+            packs={activePacks}
             accuracy={accuracy}
           />
         )}
         {tab === "import" && (
           <Import
-            setRaw={setRaw}
-            onImport={importWords}
             uploadStatus={uploadStatus}
-            onGenerateLibrary={generateLibraryPack}
-            onPlanWordbook={updatePlanVocabulary}
-            libraryCount={vocab.length}
-            vocabLoading={vocabLoading}
-            generating={generating}
+            onConfirmWordbook={() => setTab("today")}
+            activeWordbookId={activeWordbookId}
+            onSelectWordbook={selectWordbook}
+            externalWordCount={externalWords.length}
           />
         )}
         {tab === "read" && (
           <Reading
+            key={pack?.id ?? `empty-${selectedDay}`}
             pack={pack}
             day={selectedDay}
             mode={readingMode}
@@ -1439,32 +1360,8 @@ export default function Page() {
             setAdjustment={setAdjustmentText}
             onRegenerate={regeneratePack}
             definitionOf={(lemma) => vocabMap.get(lemma) ?? DEFINITIONS[lemma]}
+            activeWordbookName={activeWordbookName}
             onExit={() => setTab("today")}
-          />
-        )}
-        {tab === "review" && (
-          <Review
-            card={reviewCard}
-            phase={reviewPhase}
-            reason={reviewReason}
-            dimension={reviewDimension}
-            hintLevel={reviewHintLevel}
-            onHint={() => setReviewHintLevel((level) => Math.min(5, level + 1) as HintLevel)}
-            input={reviewInput}
-            setInput={setReviewInput}
-            feedback={feedback}
-            revealed={reviewRevealed}
-            pendingRating={pendingReviewRating}
-            evaluation={reviewEvaluation}
-            definitionEn={reviewCard ? vocabMap.get(reviewCard.lemma) ?? reviewCard.definitionEn : undefined}
-            evaluating={reviewEvaluating}
-            sessionDone={reviewSessionDone}
-            complete={reviewComplete}
-            context={reviewContext}
-            onEvaluate={evaluateReviewAnswer}
-            onRate={chooseReviewRating}
-            onContinue={commitReviewRating}
-            onSeedDemo={seedReviewDemo}
           />
         )}
         {tab === "progress" && (
@@ -1474,18 +1371,19 @@ export default function Page() {
           <StatisticsView
             cards={cards}
             attempts={attempts}
-            packs={packs}
+            packs={activePacks}
             completedDays={completedDays}
           />
         )}
         {tab === "settings" && (
           <Settings
             settings={aiSettings}
-            setSettings={setAiSettings}
+            setSettings={applySettings}
             onExport={exportLearningData}
             onReset={resetApplication}
-            libraryCount={vocab.length}
+            libraryCount={mergedVocab.length}
             vocabLoading={vocabLoading}
+            activeWordbookName={activeWordbookName}
           />
         )}
         {toast && (
@@ -1518,52 +1416,200 @@ export default function Page() {
   );
 }
 
-function Import({
-  setRaw,
-  onImport,
-  uploadStatus,
-  onGenerateLibrary,
-  onPlanWordbook,
-  libraryCount,
-  vocabLoading,
-  generating,
+type WordbookRailState = {
+  clientWidth: number;
+  scrollLeft: number;
+  scrollWidth: number;
+};
+
+function HorizontalWordbookRail({
+  children,
+  label,
 }: {
-  setRaw: (v: string) => void;
-  onImport: () => void;
+  children: ReactNode;
+  label: string;
+}) {
+  const railRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<{ startX: number; startScrollLeft: number; moved: boolean } | null>(null);
+  const suppressClickRef = useRef(false);
+  const [dragging, setDragging] = useState(false);
+  const [railState, setRailState] = useState<WordbookRailState>({
+    clientWidth: 0,
+    scrollLeft: 0,
+    scrollWidth: 0,
+  });
+
+  const syncRailState = useCallback(() => {
+    const rail = railRef.current;
+    if (!rail) return;
+    setRailState({
+      clientWidth: rail.clientWidth,
+      scrollLeft: rail.scrollLeft,
+      scrollWidth: rail.scrollWidth,
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    const rail = railRef.current;
+    if (!rail) return;
+    syncRailState();
+    rail.addEventListener("scroll", syncRailState, { passive: true });
+    const resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(syncRailState);
+    resizeObserver?.observe(rail);
+    return () => {
+      rail.removeEventListener("scroll", syncRailState);
+      resizeObserver?.disconnect();
+    };
+  }, [syncRailState, children]);
+
+  const scrollRail = (direction: -1 | 1) => {
+    const rail = railRef.current;
+    if (!rail) return;
+    rail.scrollBy({
+      left: direction * Math.max(rail.clientWidth * 0.72, 240),
+      behavior: "smooth",
+    });
+  };
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const rail = railRef.current;
+    if (!rail) return;
+    dragRef.current = {
+      startX: event.clientX,
+      startScrollLeft: rail.scrollLeft,
+      moved: false,
+    };
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    const rail = railRef.current;
+    if (!drag || !rail) return;
+    const distance = event.clientX - drag.startX;
+    if (!drag.moved && Math.abs(distance) < 6) return;
+    if (!drag.moved) {
+      drag.moved = true;
+      suppressClickRef.current = true;
+      setDragging(true);
+      rail.setPointerCapture(event.pointerId);
+    }
+    rail.scrollLeft = drag.startScrollLeft - distance;
+    event.preventDefault();
+  };
+
+  const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    const rail = railRef.current;
+    if (rail?.hasPointerCapture(event.pointerId)) rail.releasePointerCapture(event.pointerId);
+    dragRef.current = null;
+    setDragging(false);
+  };
+
+  const handleClickCapture = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!suppressClickRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    suppressClickRef.current = false;
+  };
+
+  const maxScroll = Math.max(railState.scrollWidth - railState.clientWidth, 0);
+
+  return (
+    <div className="wordbook-rail-wrap">
+      <div className="wordbook-rail-shell">
+        <button
+          type="button"
+          className="wordbook-rail-control"
+          aria-label={`向左浏览${label}`}
+          disabled={railState.scrollLeft <= 1}
+          onClick={() => scrollRail(-1)}
+        >
+          <span aria-hidden="true">←</span>
+        </button>
+        <div
+          ref={railRef}
+          className={`wordbook-rail${dragging ? " is-dragging" : ""}`}
+          role="region"
+          aria-label={label}
+          tabIndex={0}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onClickCapture={handleClickCapture}
+        >
+          {children}
+        </div>
+        <button
+          type="button"
+          className="wordbook-rail-control"
+          aria-label={`向右浏览${label}`}
+          disabled={railState.scrollLeft >= maxScroll - 1}
+          onClick={() => scrollRail(1)}
+        >
+          <span aria-hidden="true">→</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+function Import({
+  uploadStatus,
+  onConfirmWordbook,
+  activeWordbookId,
+  onSelectWordbook,
+  externalWordCount,
+}: {
   uploadStatus: string | null;
-  onGenerateLibrary: () => void;
-  onPlanWordbook: (wordCount: number) => void;
-  libraryCount: number;
-  vocabLoading: boolean;
-  generating: boolean;
+  onConfirmWordbook: () => void;
+  activeWordbookId: string;
+  onSelectWordbook: (id: string, wordCount: number) => void | Promise<void>;
+  externalWordCount: number;
 }) {
   const customWordbooks = useLiveQuery(
     () => learningDB.wordbooks.orderBy("createdAt").toArray(),
     [],
   ) ?? [];
-  const [activeWordbook, setActiveWordbook] = useState("builtin-ielts");
   const [creatorOpen, setCreatorOpen] = useState(false);
   const [newBookName, setNewBookName] = useState("");
   const [newBookWords, setNewBookWords] = useState("");
+  const [newBookFile, setNewBookFile] = useState<File | null>(null);
+  const [extractingFile, setExtractingFile] = useState(false);
   const [creatorError, setCreatorError] = useState<string | null>(null);
+  const [externalInput, setExternalInput] = useState("");
+  const [externalStatus, setExternalStatus] = useState<string | null>(null);
+  const activeBuiltinWordbook = getBuiltinWordbook(activeWordbookId);
+
+  const visibleWordbooks = customWordbooks.filter(
+    (book) => book.id !== EXTERNAL_VOCABULARY_ID && !isBuiltinWordbookId(book.id),
+  );
+
+  const builtinGroups = [
+    {
+      category: "domestic-exam" as const,
+      label: "国内考试",
+      description: "大学英语、专四专八与考研词汇",
+    },
+    {
+      category: "international-exam" as const,
+      label: "国际考试",
+      description: "留学与商科申请常用词汇",
+    },
+  ];
 
   const selectCustomWordbook = (book: UserWordbook) => {
-    setActiveWordbook(book.id);
-    setRaw(book.words);
-    onPlanWordbook(book.words.split("\n").length);
+    void onSelectWordbook(book.id, parseExternalWords(book.words).length);
   };
 
   const createWordbook = async () => {
     const name = newBookName.trim();
-    const words = [
-      ...new Set(
-        (newBookWords.match(/[A-Za-z][A-Za-z'-]*/g) ?? []).map((word) =>
-          word.toLowerCase(),
-        ),
-      ),
-    ];
+    const words = parseExternalWords(newBookWords);
     if (!name) {
       setCreatorError("请填写词书名称。");
+      return;
+    }
+    if (["IELTS 核心词库", "内置 IELTS 词库"].includes(name) || visibleWordbooks.some((book) => book.name.trim().toLowerCase() === name.toLowerCase())) {
+      setCreatorError("已有同名词书，请换一个名称，避免计划和进度混淆。");
       return;
     }
     if (!words.length) {
@@ -1582,6 +1628,7 @@ function Import({
     setCreatorOpen(false);
     setNewBookName("");
     setNewBookWords("");
+    setNewBookFile(null);
     setCreatorError(null);
   };
 
@@ -1601,62 +1648,148 @@ function Import({
             <span aria-hidden="true">＋</span> 新建词书
           </button>
         </div>
-        <div className="wordbook-rail">
-          <button
-            type="button"
-            className={`wordbook-card ${activeWordbook === "builtin-ielts" ? "active" : ""}`}
-            onClick={() => {
-              setActiveWordbook("builtin-ielts");
-              onPlanWordbook(libraryCount || 4000);
-            }}
-          >
-            <span className="wordbook-index">内置 · Academic</span>
-            <strong>IELTS 核心词库</strong>
-            <span>{vocabLoading ? "正在读取词库" : `${libraryCount.toLocaleString()} 个词条`}</span>
-            <i>{activeWordbook === "builtin-ielts" ? "当前词书" : "选择词书"}</i>
-          </button>
-          {customWordbooks.map((book, index) => (
-            <button
-              type="button"
-              key={book.id}
-              className={`wordbook-card custom ${activeWordbook === book.id ? "active" : ""}`}
-              onClick={() => selectCustomWordbook(book)}
-            >
-              <span className="wordbook-index">自定义 · {String(index + 1).padStart(2, "0")}</span>
-              <strong>{book.name}</strong>
-              <span>{book.words.split("\n").length} 个词条</span>
-              <i>{activeWordbook === book.id ? "当前词书" : "选择词书"}</i>
-            </button>
-          ))}
-          <button
-            type="button"
-            className="wordbook-card wordbook-empty-card"
-            onClick={() => setCreatorOpen(true)}
-          >
-            <span className="wordbook-plus" aria-hidden="true">＋</span>
-            <strong>建立自己的词书</strong>
-            <span>粘贴词表后保存在本机</span>
-          </button>
+        <div className="wordbook-groups">
+          {builtinGroups.map((group) => {
+            const books = BUILTIN_WORDBOOKS.filter((book) => book.category === group.category);
+            return (
+              <section className="wordbook-category-group" key={group.category} aria-labelledby={`wordbook-${group.category}`}>
+                <div className="wordbook-category-head">
+                  <div>
+                    <p className="eyebrow">{group.label}</p>
+                    <h2 id={`wordbook-${group.category}`}>{group.description}</h2>
+                  </div>
+                  <span>{books.length} 本内置词书</span>
+                </div>
+                <HorizontalWordbookRail label={`${group.label}词书`}>
+                  {books.map((book) => {
+                    const isActive = activeWordbookId === book.id;
+                    return (
+                      <button
+                        type="button"
+                        key={book.id}
+                        title={book.sourceLabel}
+                        className={`wordbook-card ${isActive ? "active" : ""}`}
+                        onClick={() => void onSelectWordbook(book.id, book.wordCount)}
+                      >
+                        <span className="wordbook-index">内置 · {book.shortName}</span>
+                        <strong>{book.name}</strong>
+                        <span>{book.wordCount.toLocaleString()} 个词条</span>
+                        <i>{isActive ? "✓ 已选中" : "选择词书"}</i>
+                      </button>
+                    );
+                  })}
+                </HorizontalWordbookRail>
+              </section>
+            );
+          })}
+          <section className="wordbook-category-group" aria-labelledby="wordbook-custom">
+            <div className="wordbook-category-head">
+              <div>
+                <p className="eyebrow">本地词库</p>
+                <h2 id="wordbook-custom">你的积累与自定义词书</h2>
+              </div>
+              <span>{visibleWordbooks.length} 本已保存</span>
+            </div>
+            <HorizontalWordbookRail label="本地与自定义词书">
+              {visibleWordbooks.map((book, index) => (
+                <button
+                  type="button"
+                  key={book.id}
+                  className={`wordbook-card custom ${activeWordbookId === book.id ? "active" : ""}`}
+                  onClick={() => selectCustomWordbook(book)}
+                >
+                  <span className="wordbook-index">自定义 · {String(index + 1).padStart(2, "0")}</span>
+                  <strong>{book.name}</strong>
+                  <span>{parseExternalWords(book.words).length} 个词条</span>
+                  <i>{activeWordbookId === book.id ? "当前词书" : "选择词书"}</i>
+                </button>
+              ))}
+              <button
+                type="button"
+                className="wordbook-card wordbook-empty-card"
+                onClick={() => setCreatorOpen(true)}
+              >
+                <span className="wordbook-plus" aria-hidden="true">＋</span>
+                <strong>建立自己的词书</strong>
+                <span>上传 Word、TXT 或 PDF 后保存在本机</span>
+              </button>
+            </HorizontalWordbookRail>
+          </section>
         </div>
         <div className="wordbook-current-bar">
           <div>
             <span>当前词书</span>
             <strong>
-              {activeWordbook === "builtin-ielts"
-                ? "IELTS 核心词库"
-                : customWordbooks.find((book) => book.id === activeWordbook)?.name ?? "自定义词书"}
+              {activeBuiltinWordbook?.name ?? customWordbooks.find((book) => book.id === activeWordbookId)?.name ?? "自定义词书"}
             </strong>
           </div>
           <button
             type="button"
             className="button"
-            disabled={generating || vocabLoading}
-            onClick={activeWordbook === "builtin-ielts" ? onGenerateLibrary : onImport}
+            onClick={onConfirmWordbook}
           >
-            {generating ? "正在生成请稍后…" : "开始今日学习"}
+            选中词书
           </button>
         </div>
         {uploadStatus && <p className="small upload-status">{uploadStatus}</p>}
+      </section>
+
+      <section className="external-vocab-panel" aria-labelledby="external-vocab-heading">
+        <div className="external-vocab-copy">
+          <p className="eyebrow">Daily capture / 外部词汇</p>
+          <h2 id="external-vocab-heading">遇到不会的词，先放进你的词库。</h2>
+          <p className="lede">
+            只输入英文单词即可，支持空格、换行、逗号或复制整段文字。已有词会优先进入下一篇语境短文，新词会加入本地大词库。
+          </p>
+        </div>
+        <div className="external-vocab-form">
+          <label htmlFor="external-vocab-input">单词列表</label>
+          <textarea
+            id="external-vocab-input"
+            value={externalInput}
+            onChange={(event) => {
+              setExternalInput(event.target.value);
+              setExternalStatus(null);
+            }}
+            placeholder="例如：feasible, allocate\n或者每行输入一个单词"
+            rows={4}
+          />
+          <div className="external-vocab-actions">
+            <span className="small muted">已积累 {externalWordCount} 个外部词</span>
+            <button
+              type="button"
+              className="button"
+              disabled={!externalInput.trim()}
+              onClick={async () => {
+                const incoming = parseExternalWords(externalInput);
+                if (!incoming.length) {
+                  setExternalStatus("没有识别到英文单词，请检查输入。 ");
+                  return;
+                }
+                const existing = await learningDB.wordbooks.get(EXTERNAL_VOCABULARY_ID);
+                const existingWords = existing?.words ?? "";
+                const previous = new Set(parseExternalWords(existingWords));
+                const added = incoming.filter((word) => !previous.has(word));
+                await learningDB.wordbooks.put({
+                  id: EXTERNAL_VOCABULARY_ID,
+                  name: EXTERNAL_VOCABULARY_NAME,
+                  words: [...previous, ...added].join("\n"),
+                  createdAt: existing?.createdAt ?? new Date().toISOString(),
+                });
+                scheduleServerSnapshotSync();
+                setExternalInput("");
+                setExternalStatus(
+                  added.length
+                    ? `已加入 ${added.length} 个词；${added.length === 1 ? "它" : "它们"}会优先出现在下一次生成中。`
+                    : "这些词已经在外部积累词库中，会按计划优先使用。",
+                );
+              }}
+            >
+              加入词库
+            </button>
+          </div>
+          {externalStatus && <p className="small external-vocab-status" role="status">{externalStatus}</p>}
+        </div>
       </section>
 
       {creatorOpen && (
@@ -1682,18 +1815,42 @@ function Import({
                 />
               </label>
               <label>
-                <span>词书内容</span>
-                <textarea
-                  rows={5}
-                  value={newBookWords}
-                  onChange={(event) => setNewBookWords(event.target.value)}
-                  placeholder="每行一个单词，或使用逗号分隔"
+                <span>上传词书文件</span>
+                <input
+                  className="wordbook-file-input"
+                  type="file"
+                  accept=".txt,.csv,.md,.docx,.pdf,text/plain,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  onChange={async (event) => {
+                    const file = event.target.files?.[0];
+                    if (!file) return;
+                    setNewBookFile(file);
+                    setCreatorError(null);
+                    setExtractingFile(true);
+                    try {
+                      const form = new FormData();
+                      form.append("file", file);
+                      const response = await fetch("/api/context-packs/extract", { method: "POST", body: form });
+                      const result = (await response.json()) as { text?: string; message?: string; error?: string };
+                      if (!response.ok) throw new Error(result.error ?? result.message ?? "文件解析失败");
+                      const words = parseExternalWords(result.text ?? "");
+                      if (!words.length) throw new Error("文件中没有识别到英文单词，请换一个词表文件。");
+                      setNewBookWords(words.join("\n"));
+                    } catch (error) {
+                      setNewBookWords("");
+                      setCreatorError(error instanceof Error ? error.message : "文件解析失败，请重试。");
+                    } finally {
+                      setExtractingFile(false);
+                    }
+                  }}
                 />
+                <span className="wordbook-file-hint">
+                  {extractingFile ? "正在解析文件…" : newBookFile ? `${newBookFile.name} · 已识别 ${parseExternalWords(newBookWords).length} 个词` : "支持 .docx、.txt、.csv、.md、.pdf；旧版 .doc 请另存为 .docx"}
+                </span>
               </label>
               {creatorError && <p className="wordbook-form-error">{creatorError}</p>}
               <div className="dialog-actions">
                 <button type="button" className="button ghost" onClick={() => setCreatorOpen(false)}>取消</button>
-                <button type="button" className="button" onClick={createWordbook}>保存并使用</button>
+                <button type="button" className="button" disabled={extractingFile} onClick={createWordbook}>保存并使用</button>
               </div>
             </div>
           </section>
@@ -1710,6 +1867,7 @@ function Settings({
   onReset,
   libraryCount,
   vocabLoading,
+  activeWordbookName,
 }: {
   settings: AISettings;
   setSettings: (value: AISettings) => void;
@@ -1717,12 +1875,14 @@ function Settings({
   onReset: () => Promise<void>;
   libraryCount: number;
   vocabLoading: boolean;
+  activeWordbookName: string;
 }) {
   type ServerConfigInfo = {
     serverConfigured: boolean;
     serverBaseUrl: string;
     serverModel: string | null;
   };
+
   const [draft, setDraft] = useState(settings);
   const [section, setSection] = useState<"plan" | "model" | "effects" | "reset">("plan");
   const [confirmReset, setConfirmReset] = useState(false);
@@ -1806,6 +1966,7 @@ function Settings({
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
+          probe: true,
           words: ["adapt"],
           planning: draft.planning,
           model: draft.model,
@@ -1815,17 +1976,6 @@ function Settings({
           extraHeaders: draft.headers,
         }),
       });
-      const contentType = response.headers.get("content-type") ?? "";
-      if (contentType.includes("text/event-stream")) {
-        const streamed = await response.text();
-        const completed = response.ok && streamed.includes('"type":"done"');
-        setTestStatus(
-          completed
-            ? `连接成功（${serverOnly ? "服务端配置" : "客户端配置"}）· 模型 ${serverConfig?.serverModel ?? draft.model} 已返回内容。`
-            : "模型已连接，但返回流不完整，请稍后重试。",
-        );
-        return;
-      }
       const result = (await response.json()) as {
         mode?: string;
         warning?: string;
@@ -1951,7 +2101,7 @@ function Settings({
                 onChange={(event) =>
                   setDraft({ ...draft, displayName: event.target.value })
                 }
-                placeholder="例如：雅思语境 AI"
+                placeholder="例如：语境记忆 AI"
               />
             </label>
             <div className="provider-config-section">
@@ -2102,7 +2252,7 @@ function Settings({
                   }
                 />
                 <small>
-                  内置 IELTS 词库共{" "}
+                  {activeWordbookName}共{" "}
                   {vocabLoading
                     ? "…"
                     : libraryCount
@@ -2167,7 +2317,7 @@ function Settings({
                   />
                   <span>
                     <strong>主题单元</strong>
-                    <small>按不同雅思主题组织词汇</small>
+                    <small>按不同主题组织词汇</small>
                   </span>
                 </label>
                 <label className={draft.planning === "story" ? "active" : ""}>
@@ -2304,6 +2454,7 @@ function Reading({
   onRegenerate,
   definitionOf,
   onExit,
+  activeWordbookName,
 }: {
   pack: ContextPack | null;
   day: number;
@@ -2332,6 +2483,7 @@ function Reading({
   onRegenerate: () => void;
   definitionOf: (lemma: string) => string | undefined;
   onExit: () => void;
+  activeWordbookName: string;
 }) {
   if (!pack)
     return (
@@ -2343,7 +2495,7 @@ function Reading({
           <p className="eyebrow">Day {day}</p>
           <h1>这一天还没有短文</h1>
           <p className="lede">
-            从内置 IELTS 词库生成当天短文，或导入你自己的词汇开始学习。
+            从{activeWordbookName}生成当天短文，或导入你自己的词汇开始学习。
           </p>
           <div className="button-row">
             <button className="button" onClick={onGenerateLibrary} disabled={vocabLoading || generating}>
@@ -2358,6 +2510,9 @@ function Reading({
     knownSet.has(word.lemma),
   ).length;
   const checkableCount = pack.targetWords.length - skippedCount;
+  const displayDifficulty = pack.difficulty.replace(/^IELTS\s+/i, "") === "advanced"
+    ? "进阶模式"
+    : "通用标准";
   return (
     <>
       <div className="reading-page">
@@ -2368,9 +2523,9 @@ function Reading({
         <section className="reading-header">
           <div>
             <p className="eyebrow">Day {day} / 语境短文</p>
-            <h1>{pack.title}</h1>
+            <h1>{pack.planDay ? `${activeWordbookName} · 第 ${pack.planDay} 天` : pack.title}</h1>
             <p className="small muted">
-              {pack.topic} · {pack.difficulty} · 目标词{" "}
+              {pack.topic} · {displayDifficulty} · 目标词{" "}
               {pack.targetWords.length} 个 ·{" "}
               <span className="status">
                 {pack.generatedBy === "ai" ? "AI 生成" : "本地模板"}
@@ -2503,6 +2658,77 @@ function Reading({
   );
 }
 
+function SpellInput({
+  target,
+  surfaceForm,
+  answer,
+  result,
+  answers,
+  setAnswers,
+  setSpellingResults,
+  typingFeedback,
+  onToggleSkip,
+}: {
+  target: ContextPack["targetWords"][number];
+  surfaceForm: string;
+  answer: string;
+  result?: SpellingResult;
+  answers: Record<string, string>;
+  setAnswers: (answers: Record<string, string>) => void;
+  setSpellingResults: React.Dispatch<React.SetStateAction<Record<string, SpellingResult>>>;
+  typingFeedback: TypingFeedbackConfig;
+  onToggleSkip: (lemma: string) => void;
+}) {
+  const measureRef = useRef<HTMLSpanElement>(null);
+  const [width, setWidth] = useState<number | null>(null);
+
+  useLayoutEffect(() => {
+    const measure = measureRef.current;
+    if (!measure) return;
+    // 用同一套字体实际测量目标词，而不是用 `ch` 估算；不同字母宽度差异很大。
+    setWidth(Math.max(12, Math.ceil(measure.getBoundingClientRect().width + 1)));
+  }, [surfaceForm]);
+
+  return (
+    <span className="inline-spell">
+      <span ref={measureRef} className="spell-input-measure" aria-hidden="true">
+        {surfaceForm}
+      </span>
+      <input
+        aria-label={`${target.meaningZh}，词性 ${formatPartOfSpeech(target.partOfSpeech)}`}
+        style={width ? { width: `${width}px` } : undefined}
+        value={answer}
+        data-spelling-result={result}
+        className={result ? `spelling-${result}` : undefined}
+        onPointerDown={() => { try { ensureTypingAudio(); } catch { /* 音频不可用 */ } }}
+        onFocus={() => { try { ensureTypingAudio(); } catch { /* 音频不可用 */ } }}
+        onKeyDown={(event) => handlePhysicalTypingKey(event, typingFeedback)}
+        onInput={(event) => triggerTypingFeedback(event, typingFeedback)}
+        onChange={(event) => {
+          setAnswers({ ...answers, [target.lemma]: event.target.value });
+          setSpellingResults((current) => {
+            if (!current[target.lemma]) return current;
+            const next = { ...current };
+            delete next[target.lemma];
+            return next;
+          });
+        }}
+        placeholder=""
+        spellCheck={false}
+      />
+      {/* 点击词后的中文提示：标记为“已经会了”，单词变橙色跳过（再点恢复） */}
+      <button
+        type="button"
+        className="spell-hint"
+        title="暂时跳过这个词（橙色标记），之后不再出现在新短文；再点击可恢复"
+        onClick={() => onToggleSkip(target.lemma)}
+      >
+        （{target.meaningZh} · {formatPartOfSpeech(target.partOfSpeech)}）
+      </button>
+    </span>
+  );
+}
+
 function renderEnglish(
   pack: ContextPack,
   mode: "show" | "spell",
@@ -2557,39 +2783,18 @@ function renderEnglish(
                 </span>
               );
             return (
-              <span className="inline-spell" key={`${sentenceIndex}-${index}`}>
-                <input
-                  aria-label={`${target.meaningZh}，词性 ${formatPartOfSpeech(target.partOfSpeech)}`}
-                  style={{ width: `${Math.max(target.lemma.length + 0.5, 3)}ch` }}
-                  value={answers[target.lemma] ?? ""}
-                  data-spelling-result={spellingResults[target.lemma]}
-                  className={spellingResults[target.lemma] ? `spelling-${spellingResults[target.lemma]}` : undefined}
-                  onPointerDown={() => { try { ensureTypingAudio(); } catch { /* 音频不可用 */ } }}
-                  onFocus={() => { try { ensureTypingAudio(); } catch { /* 音频不可用 */ } }}
-                  onKeyDown={(event) => handlePhysicalTypingKey(event, typingFeedback)}
-                  onInput={(event) => triggerTypingFeedback(event, typingFeedback)}
-                  onChange={(event) => {
-                    setAnswers({ ...answers, [target.lemma]: event.target.value });
-                    setSpellingResults((current) => {
-                      if (!current[target.lemma]) return current;
-                      const next = { ...current };
-                      delete next[target.lemma];
-                      return next;
-                    });
-                  }}
-                  placeholder=""
-                  spellCheck={false}
-                />
-                {/* 点击词后的中文提示：标记为“已经会了”，单词变红跳过（再点恢复） */}
-                <button
-                  type="button"
-                  className="spell-hint"
-                  title="暂时跳过这个词（橙色标记），之后不再出现在新短文；再点击可恢复"
-                  onClick={() => onToggleSkip(target.lemma)}
-                >
-                  （{target.meaningZh} · {formatPartOfSpeech(target.partOfSpeech)}）
-                </button>
-              </span>
+              <SpellInput
+                key={`${sentenceIndex}-${index}`}
+                target={target}
+                surfaceForm={part}
+                answer={answers[target.lemma] ?? ""}
+                result={spellingResults[target.lemma]}
+                answers={answers}
+                setAnswers={setAnswers}
+                setSpellingResults={setSpellingResults}
+                typingFeedback={typingFeedback}
+                onToggleSkip={onToggleSkip}
+              />
             );
           }
           const isKnown = knownSet.has(target.lemma);
@@ -2686,207 +2891,6 @@ function normalizeForMatch(value: string) {
     .trim();
 }
 
-const MIGRATION_TOPICS = ["摄影现场", "商业会议", "校园课堂", "科技产品", "公共服务", "旅行途中"];
-
-function migrationTopic(card: Pick<WordCard, "transferTopics" | "sourceTitle"> , seed: number) {
-  const used = new Set(card.transferTopics ?? []);
-  const source = card.sourceTitle ?? "";
-  return MIGRATION_TOPICS.find((topic) => !used.has(topic) && !source.includes(topic))
-    ?? MIGRATION_TOPICS[Math.abs(seed) % MIGRATION_TOPICS.length];
-}
-
-function reviewRiskLabel(card: Pick<WordCard, "schedule" | "lapses">) {
-  const overdue = card.schedule.nextDueAt
-    ? Date.now() - new Date(card.schedule.nextDueAt).getTime()
-    : 0;
-  if (card.lapses >= 2 || overdue > 3 * 86_400_000) return "高";
-  if (card.lapses > 0 || overdue > 0) return "中";
-  return "低";
-}
-
-function Review({
-  card,
-  phase,
-  reason,
-  dimension,
-  hintLevel,
-  onHint,
-  input,
-  setInput,
-  feedback,
-  revealed,
-  pendingRating,
-  evaluation,
-  definitionEn,
-  evaluating,
-  sessionDone,
-  complete,
-  context,
-  onEvaluate,
-  onRate,
-  onContinue,
-  onSeedDemo,
-}: {
-  card: WordCard | null;
-  phase: ReviewPhase;
-  reason: string | null;
-  dimension: CapabilityDimension;
-  hintLevel: number;
-  onHint: () => void;
-  input: string;
-  setInput: (v: string) => void;
-  feedback: string | null;
-  revealed: boolean;
-  pendingRating: ReviewRating | null;
-  evaluation: ReviewEvaluation | null;
-  definitionEn?: string;
-  evaluating: boolean;
-  sessionDone: number;
-  complete: boolean;
-  context?: string;
-  onEvaluate: () => void;
-  onRate: (rating: ReviewRating) => void;
-  onContinue: () => void;
-  onSeedDemo: () => void;
-}) {
-  if (!card)
-    return (
-      <section className="page-view panel review-empty">
-        <span className="review-empty-mark" aria-hidden="true">
-          {complete ? "✓" : "·"}
-        </span>
-        <h2>{complete ? "本轮复习完成" : "复习队列为空"}</h2>
-        <p className="lede" style={{ marginTop: 8 }}>
-          {complete
-            ? `已处理 ${sessionDone} 张词卡。高风险词会优先在下一次到期时回来。`
-            : "完成一篇阅读后，词卡会进入自适应复习队列。"}
-        </p>
-        {!complete && (
-          <div className="review-demo-actions">
-            <button type="button" className="button" onClick={onSeedDemo}>
-              载入随机体验组
-            </button>
-            <small>仅写入本机，包含 Lv1–Lv4 各一张词卡</small>
-          </div>
-        )}
-      </section>
-    );
-  const level = getMasteryLevel(card);
-  const topic = migrationTopic(card, card.correct);
-  const englishDefinition = definitionEn ?? "an English meaning is not available for this imported word yet";
-  const spec = TASK_SPECS[dimension];
-  const prompt = spec.prompt(card);
-  const hint = hintForLevel(spec, card, hintLevel);
-  const needsAnswer = true;
-  const ratingOptions: Array<{ rating: ReviewRating; label: string; note: string }> = [
-    { rating: "known", label: "认识", note: "我能理解并调用" },
-    { rating: "fuzzy", label: "模糊", note: "有印象但不稳定" },
-    { rating: "forgot", label: "忘记", note: "需要重新学习" },
-  ];
-  return (
-    <section className="page-view panel review-session">
-      <div className="review-session-head">
-        <div>
-          <p className="eyebrow">Review / 自适应复习</p>
-          <span className="review-stage-badge">{phaseLabel(phase)}</span>
-        </div>
-        <span className="small muted">本轮已完成 {sessionDone}</span>
-      </div>
-      <div className="review-ladder" aria-label="词汇掌握阶段">
-        {["Lv0 初见", "Lv1 识别", "Lv2 理解", "Lv3 调用", "Lv4 融入"].map((label, index) => (
-          <span key={label} className={index <= level ? "active" : ""}>{label}</span>
-        ))}
-      </div>
-      <p className="review-card-meta">
-        第 {card.planDay ?? "未分配"} 天 · {card.sourceTitle ?? "语境词卡"} · 当前风险 {reviewRiskLabel(card)} · 下次
-        {card.schedule.nextDueAt
-          ? new Date(card.schedule.nextDueAt).toLocaleDateString("zh-CN")
-          : "待安排"}
-      </p>
-      {reason && (
-        <p className="review-reason" role="note">
-          本次练习原因：{reason}
-        </p>
-      )}
-      <h1 className="review-prompt-title">{prompt}</h1>
-      {phase === "recognition" && context && dimension === "formRecognition" && (
-        <p className="small muted" style={{ marginTop: 10 }}>
-          原始语境：{context}
-        </p>
-      )}
-      {dimension === "meaningRecall" && (
-        <div className="semantic-definition">
-          <span>English meaning</span>
-          <strong>{englishDefinition}</strong>
-          <small>暂不显示中文，先判断你是否能从英文释义理解它。</small>
-        </div>
-      )}
-      {hint && (
-        <div className="review-hint" role="note">
-          <span>提示 {hintLevel} · {hint.label}</span>
-          <p>{hint.content}</p>
-        </div>
-      )}
-      {!hint && hintLevel < spec.hintLadder.length && (
-        <button type="button" className="button button-quiet" style={{ marginTop: 12 }} onClick={onHint}>
-          查看第 {hintLevel + 1} 级提示
-        </button>
-      )}
-      {(needsAnswer) && (
-        <>
-          {dimension === "transfer" && <span className="review-topic-chip">迁移场景 · {topic}</span>}
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder={dimension === "spelling" ? "输入英文拼写……" : dimension === "meaningRecall" || dimension === "formRecognition" || dimension === "fluency" ? "写出你想到的中文含义……" : "写一句完整、自然的英文表达……"}
-            className="review-answer-input"
-            disabled={Boolean(evaluation)}
-          />
-          {!evaluation && <button className="button" style={{ marginTop: 14 }} onClick={onEvaluate} disabled={!input.trim() || evaluating}>{evaluating ? "正在检查…" : "检查答案"}</button>}
-          {evaluation && (
-            <div className={`review-evaluation ${evaluation.passed ? "passed" : "failed"}`}>
-              <strong>{evaluation.passed ? "表达自然度通过" : "还需要调整"} · {evaluation.score}分</strong>
-              <p>{evaluation.feedback}</p>
-              {evaluation.correction && <small>参考改写：{evaluation.correction}</small>}
-            </div>
-          )}
-        </>
-      )}
-      <div className="review-rating-block">
-        <span className="small muted">这次你对这个词的真实感觉</span>
-        <div className="rating-grid rating-grid-three" role="group" aria-label="选择认识程度">
-          {ratingOptions.map((option) => (
-            <button
-              type="button"
-              key={option.rating}
-              className={`rating-option rating-${option.rating} ${pendingRating === option.rating ? "selected" : ""}`}
-              onClick={() => onRate(option.rating)}
-              disabled={needsAnswer ? !evaluation : false}
-            >
-              <strong>{option.label}</strong>
-              <small>{option.note}</small>
-            </button>
-          ))}
-        </div>
-      </div>
-      {revealed && pendingRating && (
-        <div className="review-reveal" aria-live="polite">
-          <div className="answer-comparison">
-            <div><span>词义确认</span><p>{card.meaningZh} · {card.partOfSpeech}</p></div>
-            <div><span>自然搭配</span><p>{card.collocations[0] ?? `use ${card.lemma} in context`}</p></div>
-          </div>
-          <button className="button" style={{ marginTop: 14 }} onClick={onContinue}>继续下一个词</button>
-        </div>
-      )}
-      {feedback && (
-        <div className="hint" style={{ marginTop: 16 }}>
-          {feedback}
-        </div>
-      )}
-    </section>
-  );
-}
-
 function formatPartOfSpeech(value: string | undefined): string {
   const normalized = value?.trim().toLowerCase() ?? "";
   const labels: Record<string, string> = {
@@ -2906,42 +2910,4 @@ function formatPartOfSpeech(value: string | undefined): string {
     pron: "pron.",
   };
   return labels[normalized] ?? (normalized && normalized !== "word" ? normalized : "词");
-}
-
-function buildPassage(
-  words: string[],
-  planning: PlanningMode = "topic",
-): string {
-  const seed =
-    "Rain streaked the library window as a learner opened a worn notebook. Each term became a clue inside one unfolding argument. At dusk, the page still held a clear scene, making every word easier to recall.";
-  if (!words.length) return seed;
-  // 原则：同一篇短文里每个目标词只能出现一次。seed 里已含 adapt / allocate /
-  // decline / evidence / maintain / resilient / sustainable / trend，尾部只列出
-  // seed 中没出现过的词，避免同一个词在上面和下面各出现一次。
-  const seedLower = seed.toLowerCase();
-  const freshWords = words.filter((word) => {
-    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return !new RegExp(`\\b${escaped}\\b`).test(seedLower);
-  });
-  if (!freshWords.length) return seed;
-  const chunks = Array.from(
-    { length: Math.ceil(freshWords.length / 3) },
-    (_, index) => freshWords.slice(index * 3, index * 3 + 3),
-  );
-  const places = planning === "story"
-    ? ["station map", "platform notice", "evening timetable", "conductor's notebook"]
-    : ["city sketch", "policy note", "library display", "margin of the report"];
-  const links = chunks.map((chunk, index) => {
-    const terms = chunk.length === 1
-      ? chunk[0]
-      : `${chunk.slice(0, -1).join(", ")} and ${chunk.at(-1)}`;
-    return `The learner connected ${terms} with a detail in the ${places[index % places.length]}, so the vocabulary served the idea rather than interrupting it.`;
-  });
-  return [
-    planning === "story"
-      ? "Rain streaked the station window as a learner opened a worn notebook while trains hummed beyond the glass."
-      : "Rain streaked the library window as a learner opened a worn notebook while quiet footsteps crossed the hall.",
-    ...links,
-    "By dusk, the page had become a coherent scene and a usable argument, making each expression easier to recall in future writing.",
-  ].join(" ");
 }
