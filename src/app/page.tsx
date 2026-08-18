@@ -508,8 +508,15 @@ export default function Page() {
         });
       }
     };
-    const { passage, translation, meanings, keySentence, passageMeta, generatedBy, modeNote } =
-      await fetchGeneratedPack(selectedWords, "", onProgress);
+    let generated: Awaited<ReturnType<typeof fetchGeneratedPack>>;
+    try {
+      generated = await fetchGeneratedPack(selectedWords, "", onProgress);
+    } catch {
+      setToast({ message: `第 ${targetDay} 天短文生成超时或中断，已恢复按钮，可以稍后重试。` });
+      setGenerating(false);
+      return;
+    }
+    const { passage, translation, meanings, keySentence, passageMeta, generatedBy, modeNote } = generated;
     let nextPackValue: ContextPack;
     try {
       nextPackValue = makePack(
@@ -588,8 +595,8 @@ export default function Page() {
     let parsed = first.text ? parseContextPack(first.text, words) : undefined;
     if (parsed?.passage) {
       // 质量门：重复目标词、明显超长、漏词、或逐词中文翻译标注不完整时重写。
-      // 翻译标注是最容易失败的环节，最多补两次（共三次尝试），并逐次给出更明确的指令。
-      for (let attempt = 0; attempt < 2; attempt++) {
+      // 翻译标注失败时最多补一次，避免一次生成被重复请求拖到很久。
+      for (let attempt = 0; attempt < 1; attempt++) {
         const candidate = parsed.passage;
         if (!candidate) break;
         const duplicated = findDuplicateTarget(candidate, words);
@@ -685,6 +692,7 @@ export default function Page() {
       const response = await fetch("/api/context-packs/generate", {
         method: "POST",
         headers: { "content-type": "application/json" },
+        signal: AbortSignal.timeout(45_000),
         body: JSON.stringify({
           words,
           planning: aiSettings.planning,

@@ -110,17 +110,19 @@ export async function POST(request: Request): Promise<Response> {
 中文翻译约定（必须遵守）：先写完整的 translation 覆盖正文每一句，再从 translation 中逐字复制每个目标词对应的连续中文片段作为其 translationZh；禁止改写、增删字词、加括号或引号、换用同义词，否则该词的中文划线将无法与全文对应。示例：若 translation 中含“准确读数”，accurate 的 translationZh 应写“准确读数”，不得写词典义“准确的”。`;
   try {
     const endpoint = protocol === "openai_responses" ? "responses" : "chat/completions";
-    // thinking.disabled：实测把思考时间从 10-16s 压到 0.7-1.2s（TTFT）、总耗时 3.5s 左右。
-    // 不兼容的网关会忽略该参数，退回默认行为，无副作用。
+    // Qwen 3.7/3.6/3.5 默认开启思考，必须使用其官方的顶层 enable_thinking=false。
+    // 仅对 Qwen/Model Studio 发送该字段，避免影响严格校验 OpenAI 请求体的服务。
+    const isQwenProvider = /(^qwen|dashscope|maas\.aliyuncs\.com)/i.test(`${model} ${baseUrl}`);
+    const modelControls = isQwenProvider ? { enable_thinking: false, max_tokens: 2400 } : { max_tokens: 2400 };
     const payload =
       protocol === "openai_responses"
-        ? { model, temperature: 0.2, stream: true, thinking: { type: "disabled" }, input: [{ role: "system", content: "你是严谨的 IELTS Writing 教研编辑。优先保证情境真实、语义连贯和搭配自然，再考虑句式难度。直接输出符合格式、语法准确的最终 JSON，禁止思考、禁止解释、不要输出推理过程。" }, { role: "user", content: prompt }] }
-        : { model, temperature: 0.2, stream: true, thinking: { type: "disabled" }, messages: [{ role: "system", content: "你是严谨的 IELTS Writing 教研编辑。优先保证情境真实、语义连贯和搭配自然，再考虑句式难度。直接输出符合格式、语法准确的最终 JSON，禁止思考、禁止解释、不要输出推理过程。" }, { role: "user", content: prompt }] };
+        ? { model, temperature: 0.2, stream: true, ...modelControls, input: [{ role: "system", content: "你是严谨的 IELTS Writing 教研编辑。优先保证情境真实、语义连贯和搭配自然，再考虑句式难度。直接输出符合格式、语法准确的最终 JSON，禁止思考、禁止解释、不要输出推理过程。" }, { role: "user", content: prompt }] }
+        : { model, temperature: 0.2, stream: true, ...modelControls, messages: [{ role: "system", content: "你是严谨的 IELTS Writing 教研编辑。优先保证情境真实、语义连贯和搭配自然，再考虑句式难度。直接输出符合格式、语法准确的最终 JSON，禁止思考、禁止解释、不要输出推理过程。" }, { role: "user", content: prompt }] };
     const upstream = await fetch(`${baseUrl}/${endpoint}`, {
       method: "POST",
       headers: { ...extraHeaders, "content-type": "application/json", authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(90_000),
+      signal: AbortSignal.timeout(60_000),
     });
     if (!upstream.ok || !upstream.body) {
       return NextResponse.json({ mode: "local", words, planning, serverConfigured, model, warning: `AI 请求失败（HTTP ${upstream.status}），已回退本地短文。` });
