@@ -55,8 +55,18 @@ import {
 /** 全局轻提示：生成完成等后台结果的通知。 */
 type Toast = {
   message: string;
+  loading?: boolean;
   action?: { label: string; onClick: () => void };
 };
+
+function LoadingLabel({ children }: { children: ReactNode }) {
+  return (
+    <span className="loading-label">
+      <span className="loading-spinner" aria-hidden="true" />
+      <span>{children}</span>
+    </span>
+  );
+}
 
 let typingAudioContext: AudioContext | null = null;
 let typingNoiseBuffer: AudioBuffer | null = null;
@@ -251,8 +261,6 @@ export default function Page() {
   const [toast, setToast] = useState<Toast | null>(null);
   /** 阅读页右上角的调整意见（重新生成时发给 AI）。 */
   const [adjustmentText, setAdjustmentText] = useState("");
-  /** 流式生成进度节流：避免每收到几个字就重渲染一次。 */
-  const progressRef = useRef(0);
   /** 同一篇历史本地模板只自动升级一次，避免刷新/切换时重复调用模型。 */
   const localPackRefreshRef = useRef(new Set<string>());
   const [storageReady, setStorageReady] = useState(false);
@@ -493,7 +501,7 @@ export default function Page() {
     };
   }, [activeWordbookId]);
   useEffect(() => {
-    if (!toast) return;
+    if (!toast || toast.loading) return;
     const timer = window.setTimeout(() => setToast(null), 8000);
     return () => window.clearTimeout(timer);
   }, [toast]);
@@ -589,15 +597,12 @@ export default function Page() {
 
     setGenerating(true);
     setUploadStatus(`正在将第 ${day} 天本地模板升级为 AI 短文，请稍后…`);
-    progressRef.current = 0;
+    setToast({ message: `AI 正在生成第 ${day} 天短文…`, loading: true });
     try {
-      const generated = await fetchGeneratedPack(words, "", (chars) => {
-        if (chars - progressRef.current < 20) return;
-        progressRef.current = chars;
-        setUploadStatus(`正在生成第 ${day} 天 AI 短文… 已生成 ${chars} 字`);
-      });
+      const generated = await fetchGeneratedPack(words, "");
       if (generated.generatedBy !== "ai") {
         setUploadStatus(generated.modeNote);
+        setToast({ message: "AI 暂时不可用，已保留原有短文，可稍后重试。" });
         return;
       }
       const nextPackValue = makePack(
@@ -624,6 +629,7 @@ export default function Page() {
       setToast({ message: `第 ${day} 天已自动更新为 AI 生成短文。` });
     } catch {
       setUploadStatus("AI 短文升级失败，暂时保留本地模板，可稍后手动重新生成。");
+      setToast({ message: `第 ${day} 天 AI 短文生成失败，已保留原有短文。` });
     } finally {
       setGenerating(false);
     }
@@ -665,19 +671,10 @@ export default function Page() {
     setUploadStatus(
       `正在生成第 ${targetDay} 天短文（AI 生成中）${droppedKnown > 0 ? `，已排除 ${droppedKnown} 个已会的词` : ""}，请稍后…`,
     );
-    progressRef.current = 0;
-    setToast({ message: `正在生成第 ${targetDay} 天短文（AI 生成中）…` });
-    const onProgress = (chars: number) => {
-      if (chars - progressRef.current >= 20) {
-        progressRef.current = chars;
-        setToast({
-          message: `正在生成第 ${targetDay} 天短文（AI 生成中）… 已生成 ${chars} 字`,
-        });
-      }
-    };
+    setToast({ message: `AI 正在生成第 ${targetDay} 天短文…`, loading: true });
     let generated: Awaited<ReturnType<typeof fetchGeneratedPack>>;
     try {
-      generated = await fetchGeneratedPack(selectedWords, "", onProgress);
+      generated = await fetchGeneratedPack(selectedWords, "");
     } catch {
       setToast({ message: `第 ${targetDay} 天短文生成超时或中断，已恢复按钮，可以稍后重试。` });
       setGenerating(false);
@@ -945,19 +942,10 @@ export default function Page() {
     }
     setGenerating(true);
     setUploadStatus(`正在按你的意见重新生成第 ${targetDay} 天短文（AI 生成中），请稍后…`);
-    progressRef.current = 0;
-    setToast({ message: `正在按你的意见重新生成第 ${targetDay} 天短文（AI 生成中）…` });
-    const onProgress = (chars: number) => {
-      if (chars - progressRef.current >= 20) {
-        progressRef.current = chars;
-        setToast({
-          message: `正在按你的意见重新生成第 ${targetDay} 天短文（AI 生成中）… 已生成 ${chars} 字`,
-        });
-      }
-    };
+    setToast({ message: `AI 正在重新生成第 ${targetDay} 天短文…`, loading: true });
     let generated: Awaited<ReturnType<typeof fetchGeneratedPack>>;
     try {
-      generated = await fetchGeneratedPack(words, adjustment, onProgress);
+      generated = await fetchGeneratedPack(words, adjustment);
     } catch {
       setToast({ message: `第 ${targetDay} 天短文重新生成超时或中断，已恢复按钮，可以稍后重试。` });
       setGenerating(false);
@@ -1462,7 +1450,8 @@ export default function Page() {
           />
         )}
         {toast && (
-          <div className="toast" role="status" aria-live="polite">
+          <div className={`toast${toast.loading ? " is-loading" : ""}`} role="status" aria-live="polite" aria-busy={toast.loading || undefined}>
+            {toast.loading && <span className="loading-spinner" aria-hidden="true" />}
             <span className="toast-message">{toast.message}</span>
             {toast.action && (
               <button
@@ -2574,7 +2563,7 @@ function Reading({
           </p>
           <div className="button-row">
             <button className="button" onClick={onGenerateLibrary} disabled={vocabLoading || generating}>
-              {generating ? "正在生成请稍后…" : vocabLoading ? "词库加载中…" : `生成第 ${day} 天短文`}
+              {generating ? <LoadingLabel>AI 正在生成…</LoadingLabel> : vocabLoading ? "词库加载中…" : `生成第 ${day} 天短文`}
             </button>
             <button className="button ghost" onClick={onGoImport}>去导入词汇</button>
           </div>
