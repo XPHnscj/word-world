@@ -72,7 +72,7 @@ let typingAudioContext: AudioContext | null = null;
 let typingNoiseBuffer: AudioBuffer | null = null;
 const lastPhysicalKeySound = new WeakMap<HTMLInputElement, number>();
 type SpellingResult = "correct" | "wrong";
-type TypingFeedbackConfig = Pick<AISettings, "typingShake" | "particleSize" | "particleFrequency" | "typingSound">;
+type TypingFeedbackConfig = Pick<AISettings, "typingShake" | "particleSize" | "particleFrequency" | "particleStyle" | "typingSound">;
 
 function ensureTypingAudio() {
   typingAudioContext ??= new AudioContext({ latencyHint: "interactive" });
@@ -100,36 +100,50 @@ function playTypingKeySound(kind: "character" | "space" | "delete", sound: AISet
     const clickFilter = context.createBiquadFilter();
     const clickGain = context.createGain();
     click.buffer = typingNoiseBuffer;
-    click.playbackRate.setValueAtTime(
-      kind === "delete" ? 0.78 : kind === "space" ? 0.9 : 0.98 + Math.random() * 0.14,
-      now,
-    );
+    const isThock = sound === "thock";
+    const isTypewriter = sound === "typewriter";
+    const isArcade = sound === "arcade";
+    click.playbackRate.setValueAtTime(kind === "delete" ? 0.78 : kind === "space" ? 0.9 : 0.98 + Math.random() * 0.14, now);
     clickFilter.type = "bandpass";
     clickFilter.frequency.setValueAtTime(
-      sound === "soft" ? 820 + Math.random() * 120 : kind === "delete" ? 1250 : 1850 + Math.random() * 280,
+      sound === "soft"
+        ? 820 + Math.random() * 120
+        : isThock
+          ? 620 + Math.random() * 90
+          : isTypewriter
+            ? 2850 + Math.random() * 520
+            : isArcade
+              ? 1450 + Math.random() * 180
+              : kind === "delete" ? 1250 : 1850 + Math.random() * 280,
       now,
     );
-    clickFilter.Q.setValueAtTime(0.75, now);
-    clickGain.gain.setValueAtTime(sound === "soft" ? 0.046 : kind === "space" ? 0.075 : 0.09, now);
-    clickGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.03);
+    clickFilter.Q.setValueAtTime(isTypewriter ? 1.5 : 0.75, now);
+    clickGain.gain.setValueAtTime(sound === "soft" ? 0.046 : isThock ? 0.065 : isTypewriter ? 0.078 : kind === "space" ? 0.075 : 0.09, now);
+    clickGain.gain.exponentialRampToValueAtTime(0.0001, now + (isTypewriter ? 0.045 : 0.03));
     click.connect(clickFilter);
     clickFilter.connect(clickGain);
     clickGain.connect(context.destination);
     click.start(now);
-    click.stop(now + 0.035);
+    click.stop(now + (isTypewriter ? 0.05 : 0.035));
 
     const thock = context.createOscillator();
     const thockGain = context.createGain();
-    thock.type = sound === "soft" ? "sine" : "triangle";
-    const base = kind === "delete" ? 82 : kind === "space" ? 104 : 118 + Math.random() * 14;
-    thock.frequency.setValueAtTime(base * 1.35, now);
-    thock.frequency.exponentialRampToValueAtTime(base, now + 0.032);
-    thockGain.gain.setValueAtTime(kind === "space" ? 0.045 : 0.036, now);
-    thockGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.052);
+    thock.type = sound === "soft" || isThock ? "sine" : isArcade ? "square" : "triangle";
+    const base = isThock
+      ? (kind === "space" ? 74 : 86 + Math.random() * 8)
+      : isTypewriter
+        ? (kind === "space" ? 132 : 176 + Math.random() * 18)
+        : isArcade
+          ? (kind === "delete" ? 180 : kind === "space" ? 220 : 330 + Math.random() * 45)
+          : kind === "delete" ? 82 : kind === "space" ? 104 : 118 + Math.random() * 14;
+    thock.frequency.setValueAtTime(base * (isArcade ? 0.72 : 1.35), now);
+    thock.frequency.exponentialRampToValueAtTime(base * (isArcade ? 1.18 : 1), now + (isArcade ? 0.04 : 0.032));
+    thockGain.gain.setValueAtTime(isThock ? 0.065 : isArcade ? 0.025 : kind === "space" ? 0.045 : 0.036, now);
+    thockGain.gain.exponentialRampToValueAtTime(0.0001, now + (isThock ? 0.075 : isArcade ? 0.065 : 0.052));
     thock.connect(thockGain);
     thockGain.connect(context.destination);
     thock.start(now);
-    thock.stop(now + 0.055);
+    thock.stop(now + (isThock ? 0.08 : isArcade ? 0.07 : 0.055));
   } catch {
     // 浏览器禁用音频时保留其他反馈。
   }
@@ -180,25 +194,45 @@ function triggerTypingFeedback(
           6 + input.value.length * 9,
         );
         const originY = input.offsetTop + input.clientHeight - 3;
-        const count = 4 + Math.floor(Math.random() * 4);
-        const colors = ["#087d6d", "#18a58d", "#b47b25", "#d5a84f", "#315e57"];
+        const style = config.particleStyle;
+        const count = style === "confetti"
+          ? 9 + Math.floor(Math.random() * 5)
+          : style === "sparks"
+            ? 6 + Math.floor(Math.random() * 5)
+            : 4 + Math.floor(Math.random() * 4);
+        const colors = style === "sparks"
+          ? ["#fff2a8", "#ffc857", "#ff9f1c", "#ffffff"]
+          : style === "ink"
+            ? ["#087d6d", "#0d5f55", "#183d38", "#4cae9e"]
+            : style === "confetti"
+              ? ["#087d6d", "#ffbf46", "#ef6f6c", "#6b8afd", "#ffffff"]
+              : ["#087d6d", "#18a58d", "#b47b25", "#d5a84f", "#315e57"];
         for (let index = 0; index < count; index += 1) {
           const particle = document.createElement("i");
-          particle.className = "typing-particle";
+          particle.className = `typing-particle particle-${style}`;
           particle.setAttribute("aria-hidden", "true");
           particle.style.left = `${originX}px`;
           particle.style.top = `${originY}px`;
-          particle.style.setProperty("--particle-x", `${-24 + Math.random() * 48}px`);
-          particle.style.setProperty("--particle-y", `${16 + Math.random() * 26}px`);
+          const travelX = style === "confetti" ? -40 + Math.random() * 80 : -28 + Math.random() * 56;
+          const travelY = style === "sparks"
+            ? -24 - Math.random() * 34
+            : style === "ink"
+              ? -16 + Math.random() * 32
+              : 16 + Math.random() * 32;
+          particle.style.setProperty("--particle-x", `${travelX}px`);
+          particle.style.setProperty("--particle-y", `${travelY}px`);
           particle.style.setProperty("--particle-r", `${-160 + Math.random() * 320}deg`);
           particle.style.setProperty("--particle-scale", `${0.8 + Math.random() * 0.75}`);
           particle.style.setProperty("--particle-delay", `${index * 10}ms`);
           particle.style.background = colors[index % colors.length];
+          particle.style.color = colors[index % colors.length];
           const particleSize = 3 + config.particleSize / 16;
-          particle.style.width = `${particleSize * (0.85 + Math.random() * 0.35)}px`;
-          particle.style.height = `${particleSize * (0.62 + Math.random() * 0.24)}px`;
+          const widthRatio = style === "sparks" || style === "ink" ? 0.5 : 0.85 + Math.random() * 0.35;
+          const heightRatio = style === "sparks" ? 1.5 : style === "ink" ? 0.5 : 0.62 + Math.random() * 0.24;
+          particle.style.width = `${particleSize * widthRatio}px`;
+          particle.style.height = `${particleSize * heightRatio}px`;
           host.appendChild(particle);
-          window.setTimeout(() => particle.remove(), 760);
+          window.setTimeout(() => particle.remove(), style === "confetti" ? 920 : 760);
         }
       }
     }
@@ -2412,10 +2446,27 @@ function Settings({
                 {([
                   ["mechanical", "清脆机械", "清晰咔哒与低频落键"],
                   ["soft", "柔和木质", "更圆润、较低刺激"],
+                  ["thock", "深沉 Thock", "厚实触底，低频更上头"],
+                  ["typewriter", "复古打字机", "金属撞击，节奏鲜明"],
+                  ["arcade", "街机脉冲", "短促电子音，连击感强"],
                   ["muted", "静音", "保留震动与碎屑"],
                 ] as const).map(([value, label, note]) => (
                   <label className={draft.typingSound === value ? "active" : ""} key={value}>
-                    <input type="radio" name="typing-sound" value={value} checked={draft.typingSound === value} onChange={() => setDraft({ ...draft, typingSound: value })} />
+                    <input type="radio" name="typing-sound" value={value} checked={draft.typingSound === value} onChange={() => { setDraft({ ...draft, typingSound: value }); playTypingKeySound("character", value); }} />
+                    <span><strong>{label}</strong><small>{note}</small></span>
+                  </label>
+                ))}
+              </div>
+              <div className="provider-section-divider"><span>碎屑风格</span></div>
+              <div className="sound-choice-grid particle-choice-grid" role="radiogroup" aria-label="碎屑风格">
+                {([
+                  ["chips", "翡翠碎片", "清脆下落，克制耐看"],
+                  ["sparks", "金色火花", "向上迸发，命中感最强"],
+                  ["ink", "墨点飞溅", "短促扩散，沉稳有力"],
+                  ["confetti", "彩纸连击", "多彩散落，奖励感更强"],
+                ] as const).map(([value, label, note]) => (
+                  <label className={draft.particleStyle === value ? "active" : ""} key={value}>
+                    <input type="radio" name="particle-style" value={value} checked={draft.particleStyle === value} onChange={() => setDraft({ ...draft, particleStyle: value })} />
                     <span><strong>{label}</strong><small>{note}</small></span>
                   </label>
                 ))}
@@ -2425,6 +2476,20 @@ function Settings({
                 <label><span>碎屑大小 <output>{draft.particleSize}%</output></span><input type="range" min="0" max="100" step="5" value={draft.particleSize} onChange={(event) => setDraft({ ...draft, particleSize: Number(event.target.value) })} /></label>
                 <label><span>触发频率 <output>{draft.particleFrequency}%</output></span><input type="range" min="0" max="100" step="5" value={draft.particleFrequency} onChange={(event) => setDraft({ ...draft, particleFrequency: Number(event.target.value) })} /></label>
               </div>
+              <label className="typing-preview">
+                <span><strong>即时试打</strong><small>直接输入，感受当前声音与碎屑组合</small></span>
+                <span className="inline-spell">
+                  <input
+                    type="text"
+                    autoComplete="off"
+                    spellCheck={false}
+                    aria-label="试听当前打字效果"
+                    placeholder="Type something satisfying…"
+                    onKeyDown={(event) => handlePhysicalTypingKey(event, draft)}
+                    onInput={(event) => triggerTypingFeedback(event, draft)}
+                  />
+                </span>
+              </label>
             </div>
           </div>
           <div hidden={section !== "reset"}>

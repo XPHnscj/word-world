@@ -4,7 +4,6 @@ export type AppTab =
   | "today"
   | "import"
   | "read"
-  | "review"
   | "progress"
   | "statistics"
   | "settings";
@@ -25,13 +24,13 @@ export type AISettings = {
   typingShake: number;
   particleSize: number;
   particleFrequency: number;
-  typingSound: "mechanical" | "soft" | "muted";
+  particleStyle: "chips" | "sparks" | "ink" | "confetti";
+  typingSound: "mechanical" | "soft" | "thock" | "typewriter" | "arcade" | "muted";
 };
 
 export const TABS: Array<[AppTab, string]> = [
   ["today", "计划表"],
   ["import", "导入词汇"],
-  ["review", "复习队列"],
   ["progress", "学习效果"],
   ["statistics", "学习统计"],
   ["settings", "设置"],
@@ -98,6 +97,7 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
   typingShake: 55,
   particleSize: 60,
   particleFrequency: 40,
+  particleStyle: "chips",
   typingSound: "mechanical",
 };
 
